@@ -245,8 +245,9 @@ export function loadSystemPrompt(): string {
     basePrompt = `You are LiteClaw, a helpful AI assistant running locally. Be concise and helpful.`;
   }
 
-  // ── Inject date ──
-  basePrompt = basePrompt.replace('{{DATE}}', new Date().toLocaleDateString());
+  // ── Inject dynamic values ──
+  basePrompt = basePrompt.replace(/\{\{DATE\}\}/g, new Date().toLocaleDateString());
+  basePrompt = basePrompt.replace(/\{\{STATE_DIR\}\}/g, stateDir.replace(/\\/g, '/'));
 
   // ── Load personality files ──
   const PERSONALITY_FILES = [
