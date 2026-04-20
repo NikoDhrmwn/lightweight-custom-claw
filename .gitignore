@@ -21,6 +21,10 @@ sessions/
 credentials/
 memory/
 
+# Agent personality (Privacy)
+config/personality/*.md
+!config/personality/*.template.md
+
 # Scratch and temp data
 .tmp/
 tmp/
