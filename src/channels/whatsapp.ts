@@ -105,15 +105,15 @@ export class WhatsAppChannel {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        if (msg.key.fromMe) continue;
-        if (!msg.message) continue;
+        const unwrapped = unwrapMessage(msg.message);
+        if (!unwrapped) continue;
 
-        await this.handleMessage(msg);
+        await this.handleMessage(msg, unwrapped);
       }
     });
   }
 
-  private async handleMessage(msg: any): Promise<void> {
+  private async handleMessage(msg: any, messageContent: any): Promise<void> {
     const jid = msg.key.remoteJid!;
 
     // Check allow policy
@@ -127,7 +127,6 @@ export class WhatsAppChannel {
 
     // Extract text content
     let content = '';
-    const messageContent = msg.message;
 
     if (messageContent?.conversation) {
       content = messageContent.conversation;
@@ -137,7 +136,7 @@ export class WhatsAppChannel {
       content = messageContent.imageMessage.caption;
     }
 
-    const mentionTargets = this.extractMentionTargets(msg);
+    const mentionTargets = this.extractMentionTargets(msg, messageContent);
     const replyContext = this.extractReplyContext(messageContent);
 
     // Handle image messages (native multimodal)
@@ -203,14 +202,16 @@ export class WhatsAppChannel {
                           didMentionMe(messageContent, selfJidRaw) ||
                           content.toLowerCase().includes(`@${myName.toLowerCase()}`);
                           
+
       const isReplyToMe = messageContent?.extendedTextMessage?.contextInfo?.participant === selfJid ||
                           messageContent?.extendedTextMessage?.contextInfo?.participant === selfJidRaw;
-      
-      log.debug({ 
+                          
+      log.info({ 
         isGroupChat, isMentioned, isReplyToMe, 
-        selfJid, selfJidRaw,
+        selfJid, selfJidRaw, myName,
+        exactText: content,
         mentionedJids: messageContent?.extendedTextMessage?.contextInfo?.mentionedJid 
-      }, 'WhatsApp group filter check');
+      }, 'WhatsApp group filter check VERY VERBOSE');
 
       if (!isMentioned && !isReplyToMe) {
         this.engine.saveMessageSilent(request);
@@ -329,9 +330,8 @@ export class WhatsAppChannel {
     }
   }
 
-  private extractMentionTargets(msg: any): MentionTarget[] {
+  private extractMentionTargets(msg: any, messageContent: any): MentionTarget[] {
     const jid = msg.key.remoteJid!;
-    const messageContent = msg.message;
     const contextInfo =
       messageContent?.extendedTextMessage?.contextInfo ??
       messageContent?.imageMessage?.contextInfo ??
@@ -530,6 +530,7 @@ function formatReplyContext(author: string, content: string): string {
 
 function didMentionMe(messageContent: any, selfJid?: string): boolean {
   if (!selfJid) return false;
+  
   const contextInfo =
     messageContent?.extendedTextMessage?.contextInfo ??
     messageContent?.imageMessage?.contextInfo ??
@@ -538,17 +539,39 @@ function didMentionMe(messageContent: any, selfJid?: string): boolean {
 
   const mentioned: string[] = contextInfo?.mentionedJid ?? [];
   
-  // Normalize JIDs: strip device suffix (e.g., "123:10@s.whatsapp.net" → "123@s.whatsapp.net")
-  const normalizeJid = (jid: string) => jid.replace(/:\d+@/, '@');
+  // Normalize JIDs: strip device suffix (e.g., "123:10" → "123") 
+  // and handle both @s.whatsapp.net and @c.us consistently
+  const normalizeJid = (jid: string) => {
+    if (!jid) return '';
+    return jid.split(':')[0].split('@')[0];
+  };
+
   const normalizedSelf = normalizeJid(selfJid);
-  
   const matched = mentioned.some(m => normalizeJid(m) === normalizedSelf);
   
   if (!matched && mentioned.length > 0) {
-    log.debug({ selfJid, normalizedSelf, mentioned }, 'No JID match in mentions');
+    log.debug({ 
+      selfJid, 
+      normalizedSelf, 
+      mentioned: mentioned.map(m => `${m} -> ${normalizeJid(m)}`) 
+    }, 'No JID match in mentions');
   }
   
   return matched;
+}
+
+/**
+ * Unwrap message content from Baileys wrappers (ephemeral, viewOnce, etc.)
+ */
+function unwrapMessage(msg: any): any {
+  if (!msg) return null;
+  
+  if (msg.ephemeralMessage) return unwrapMessage(msg.ephemeralMessage.message);
+  if (msg.viewOnceMessage) return unwrapMessage(msg.viewOnceMessage.message);
+  if (msg.viewOnceMessageV2) return unwrapMessage(msg.viewOnceMessageV2.message);
+  if (msg.viewOnceMessageV2Extension) return unwrapMessage(msg.viewOnceMessageV2Extension.message);
+  
+  return msg;
 }
 
 function createMentionTarget(id: string, ...labels: Array<string | undefined>): MentionTarget {
