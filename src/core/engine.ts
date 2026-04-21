@@ -39,6 +39,12 @@ export interface AgentRequest {
   sendInteractiveChoice?: (request: import('./tools.js').InteractiveChoiceRequest) => Promise<string>;
 }
 
+export interface MessageMetrics {
+  tokens: number;
+  durationMs: number;
+  tokPerSec: number;
+}
+
 export interface AgentStreamEvent {
   type: 'thinking' | 'content' | 'tool_start' | 'tool_result' | 'confirmation' | 'done' | 'error';
   content?: string;
@@ -47,6 +53,7 @@ export interface AgentStreamEvent {
   toolResult?: ToolResult;
   confirmationId?: string;
   error?: string;
+  metrics?: MessageMetrics;
 }
 
 // ─── Agent Engine ────────────────────────────────────────────────────
@@ -111,7 +118,7 @@ export class AgentEngine extends EventEmitter {
       role: 'user',
       content: request.message,
       timestamp: Date.now(),
-      metadata: request.userIdentifier ? JSON.stringify({ userIdentifier: request.userIdentifier }) : undefined
+      metadata: buildRequestMetadata(request)
     });
   }
 
@@ -162,16 +169,16 @@ export class AgentEngine extends EventEmitter {
       role: 'user',
       content: request.message,
       timestamp: Date.now(),
-      metadata: request.userIdentifier ? JSON.stringify({ userIdentifier: request.userIdentifier }) : undefined
+      metadata: buildRequestMetadata(request)
     });
 
 
-    // 6. Select relevant tools (lazy loading)
-    const toolLoading = config.agent?.toolLoading ?? 'lazy';
-    const allTools = toolRegistry.getAll();
-    const selectedTools = toolLoading === 'lazy'
-      ? toolRegistry.selectRelevant(request.message, 6)
-      : allTools;
+     // 6. Select relevant tools (lazy loading)
+     const toolLoading = config.agent?.toolLoading ?? 'lazy';
+     const allTools = toolRegistry.getAll();
+     const selectedTools = toolLoading === 'lazy'
+       ? toolRegistry.selectRelevant(request.message, 12)
+       : allTools;
 
     const toolDefs = toolRegistry.toLLMToolDefs(selectedTools);
     const toolGuidance = toolRegistry.buildToolGuidance(selectedTools, request.message);
@@ -193,7 +200,7 @@ export class AgentEngine extends EventEmitter {
       if (toolGuidance) {
         finalSystemPrompt += `\n\n${toolGuidance}`;
       }
-      finalSystemPrompt += `\n\nTo use a tool, output exactly this xml format:\n<tool_call>\n{"name": "tool_name", "arguments": {"param1": "value"}}\n</tool_call>\n\nIf a tool is needed, do NOT narrate a plan or say what you will do next. Emit exactly one tool call immediately. After a tool call, wait for the system to provide a <tool_result> message before continuing. Use only ONE tool at a time.`;
+       finalSystemPrompt += `\n\nTo use a tool, output exactly this xml format WITHOUT ANY NARRATION BEFORE OR AFTER:\n<tool_call>\n{"name": "tool_name", "arguments": {"param1": "value"}}\n</tool_call>\n\nCRITICAL: If a tool is needed, DO NOT SAY "I will verify", DO NOT SAY "I need to check", DO NOT NARRATE YOUR PLAN. Emit ONLY the <tool_call> block immediately. No other text. No explanation. No reasoning about tools. Just the tool call block.\n\nAfter emitting a tool call, you will receive a <tool_result> message. You must wait for this before continuing. Use only ONE tool at a time.`;
     }
 
     // 9. Build message array
@@ -209,6 +216,10 @@ export class AgentEngine extends EventEmitter {
     let fullResponse = '';
     const toolCallHistory = new Set<string>(); // Track "toolName:argsHash" to prevent duplicates
 
+    let totalTokens = 0;
+    let allThinkingContent = '';
+    const startTime = Date.now();
+
     while (iterations < maxIterations) {
       iterations++;
       log.debug({ iteration: iterations, messages: messages.length }, 'Agent iteration');
@@ -222,11 +233,14 @@ export class AgentEngine extends EventEmitter {
         switch (chunk.type) {
           case 'thinking':
             thinkingContent += chunk.content ?? '';
+            allThinkingContent += chunk.content ?? '';
+            totalTokens += estimateTokens(chunk.content ?? '');
             yield { type: 'thinking', content: chunk.content };
             break;
 
           case 'content':
             assistantContent += chunk.content ?? '';
+            totalTokens += estimateTokens(chunk.content ?? '');
             yield { type: 'content', content: chunk.content };
             break;
 
@@ -315,14 +329,14 @@ export class AgentEngine extends EventEmitter {
         break;
       }
 
-      // ── Guard 2: Substantial-answer early exit ──
-      // If the model already produced a meaningful text answer AND is now
-      // trying to do more tool calls, stop the loop. The answer is done.
-      if (assistantContent.trim().length > 200 && iterations > 1) {
-        log.info('Model produced substantial content alongside tool calls. Finalizing response.');
-        fullResponse = assistantContent;
-        break;
-      }
+       // ── Guard 2: Substantial-answer early exit ──
+       // If the model already produced a meaningful text answer AND is now
+       // trying to do more tool calls, stop the loop. The answer is done.
+       if (assistantContent.trim().length > 500 && iterations > 2) {
+         log.info('Model produced substantial content alongside tool calls. Finalizing response.');
+         fullResponse = assistantContent;
+         break;
+       }
 
       // Add assistant's tool call message to conversation
       messages.push({
@@ -409,16 +423,30 @@ export class AgentEngine extends EventEmitter {
     }
 
     // Save assistant response to memory
-    if (fullResponse) {
+    if (fullResponse || allThinkingContent) {
+      const contentToSave = allThinkingContent 
+        ? `<think>${allThinkingContent}</think>${fullResponse}`
+        : fullResponse;
+        
       this.memory.saveMessage({
         sessionKey: request.sessionKey,
         role: 'assistant',
-        content: fullResponse,
+        content: contentToSave,
         timestamp: Date.now(),
       });
     }
 
-    yield { type: 'done' };
+    const durationMs = Date.now() - startTime;
+    const tokPerSec = durationMs > 0 ? (totalTokens / (durationMs / 1000)) : 0;
+
+    yield { 
+      type: 'done',
+      metrics: {
+        tokens: totalTokens,
+        durationMs,
+        tokPerSec
+      }
+    };
   }
 
   /**
@@ -449,6 +477,13 @@ export class AgentEngine extends EventEmitter {
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────
+
+function buildRequestMetadata(request: AgentRequest): string | undefined {
+  const metadata: Record<string, unknown> = {};
+  if (request.userIdentifier) metadata.userIdentifier = request.userIdentifier;
+  if (request.images?.length) metadata.imageCount = request.images.length;
+  return Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : undefined;
+}
 
 function safeParseJSON(str: string): Record<string, any> {
   try {

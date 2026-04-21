@@ -9,6 +9,7 @@ import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { createLogger } from '../logger.js';
+import { estimateTokens } from './context.js';
 
 const log = createLogger('memory');
 
@@ -29,6 +30,15 @@ export interface SessionInfo {
   lastActivity: number;
   firstActivity: number;
   userIdentifier?: string;
+  estimatedTokens?: number;
+}
+
+export interface SessionMetrics {
+  sessionKey: string;
+  messageCount: number;
+  estimatedTokens: number;
+  imageCount: number;
+  lastActivity: number | null;
 }
 
 // ─── Memory Store ────────────────────────────────────────────────────
@@ -185,9 +195,56 @@ export class MemoryStore {
         messageCount: r.messageCount,
         lastActivity: r.lastActivity,
         firstActivity: r.firstActivity,
-        userIdentifier: identifier
+        userIdentifier: identifier,
+        estimatedTokens: this.getSessionMetrics(r.sessionKey).estimatedTokens
       };
     });
+  }
+
+  getSessionMetrics(sessionKey: string): SessionMetrics {
+    const stmt = this.db.prepare(`
+      SELECT
+        session_key as sessionKey,
+        COUNT(*) as messageCount,
+        MAX(timestamp) as lastActivity
+      FROM messages
+      WHERE session_key = ?
+      GROUP BY session_key
+    `);
+    const summary = stmt.get(sessionKey) as {
+      sessionKey: string;
+      messageCount: number;
+      lastActivity: number | null;
+    } | undefined;
+
+    const messages = this.getHistory(sessionKey, 1000);
+    let estimatedTokens = 0;
+    let imageCount = 0;
+
+    for (const message of messages) {
+      estimatedTokens += 4;
+      estimatedTokens += estimateTokens(message.content ?? '');
+
+      if (!message.metadata) continue;
+      try {
+        const meta = JSON.parse(message.metadata);
+        const count = Number(meta.imageCount || 0);
+        if (count > 0) {
+          imageCount += count;
+          estimatedTokens += count * 300;
+        }
+      } catch {
+        // Ignore invalid metadata.
+      }
+    }
+
+    return {
+      sessionKey,
+      messageCount: summary?.messageCount ?? 0,
+      estimatedTokens,
+      imageCount,
+      lastActivity: summary?.lastActivity ?? null,
+    };
   }
 
   /**

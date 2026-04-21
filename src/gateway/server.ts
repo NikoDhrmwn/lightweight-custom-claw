@@ -124,6 +124,17 @@ export class GatewayServer {
       }
     });
 
+    this.app.get('/api/sessions/:sessionKey/metrics', (req, res) => {
+      try {
+        const memory = new MemoryStore();
+        const metrics = memory.getSessionMetrics(req.params.sessionKey);
+        memory.close();
+        res.json(metrics);
+      } catch (err: any) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
     // Delete session (clear history)
     this.app.delete('/api/sessions/:sessionKey', (req, res) => {
       try {
@@ -440,6 +451,9 @@ export class GatewayServer {
             case 'session_init':
               // Client telling us which session they're viewing — acknowledge
               log.debug({ sessionKey: msg.sessionKey }, 'WebUI session init');
+              if (msg.sessionKey && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(this.buildSessionMetricsPayload(msg.sessionKey)));
+              }
               break;
 
             case 'confirmation_response':
@@ -520,6 +534,7 @@ export class GatewayServer {
             payload.content = event.error;
             break;
           case 'done':
+            payload.metrics = event.metrics;
             break;
         }
 
@@ -527,6 +542,8 @@ export class GatewayServer {
           ws.send(JSON.stringify(payload));
         }
       }
+
+      this.broadcast(this.buildSessionMetricsPayload(sessionKey));
     } catch (err: any) {
       log.error({ error: err.message }, 'Agent process failed');
       if (ws.readyState === WebSocket.OPEN) {
@@ -623,6 +640,17 @@ export class GatewayServer {
         ws.send(msg);
       }
     }
+  }
+
+  private buildSessionMetricsPayload(sessionKey: string): Record<string, any> {
+    const memory = new MemoryStore();
+    const metrics = memory.getSessionMetrics(sessionKey);
+    memory.close();
+    return {
+      type: 'session_metrics',
+      sessionKey,
+      metrics,
+    };
   }
 }
 
