@@ -186,29 +186,29 @@ export class WhatsAppChannel {
       channelType: 'whatsapp',
       channelTarget: jid,
       userIdentifier: msg.pushName || jid.split('@')[0],
-      sendFile: async (filePath: string, fileName?: string) => {
-        await this.sendFile(jid, filePath, fileName);
-      },
     };
 
     // Ignore group chat messages unless mentioned or replied to (but save to memory for context)
     const isGroupChat = jid.endsWith('@g.us');
     if (isGroupChat) {
       const selfJidRaw = this.sock?.user?.id || '';
+      const selfLid = (this.sock?.user as any)?.lid || ''; // Handle Lid for privacy groups
       const selfJid = selfJidRaw.split(':')[0] + '@s.whatsapp.net';
       const myName = this.config.agent?.name || this.sock?.user?.name || 'Molty';
       
       const isMentioned = didMentionMe(messageContent, selfJid) || 
                           didMentionMe(messageContent, selfJidRaw) ||
-                          content.toLowerCase().includes(`@${myName.toLowerCase()}`);
-                          
-
+                          (selfLid && didMentionMe(messageContent, selfLid)) ||
+                          content.toLowerCase().includes(`@${myName.toLowerCase()}`) ||
+                          content.toLowerCase().startsWith(myName.toLowerCase()); // Handle "molty hello"
+                           
       const isReplyToMe = messageContent?.extendedTextMessage?.contextInfo?.participant === selfJid ||
-                          messageContent?.extendedTextMessage?.contextInfo?.participant === selfJidRaw;
-                          
+                          messageContent?.extendedTextMessage?.contextInfo?.participant === selfJidRaw ||
+                          (selfLid && messageContent?.extendedTextMessage?.contextInfo?.participant === selfLid);
+      
       log.info({ 
         isGroupChat, isMentioned, isReplyToMe, 
-        selfJid, selfJidRaw, myName,
+        selfJid, selfLid, myName,
         exactText: content,
         mentionedJids: messageContent?.extendedTextMessage?.contextInfo?.mentionedJid 
       }, 'WhatsApp group filter check VERY VERBOSE');
