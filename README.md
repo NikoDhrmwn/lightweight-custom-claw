@@ -11,91 +11,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [0.3.2] - 2026-04-21
+
+#### Added
+
+- **WebUI Metrics**: Added real-time "tokens per second" (tok/s) and duration metrics displayed directly below assistant messages.
+- **Thinking Accordion**: Replaced "Thinking..." text with a modern brutalist collapsible accordion. Reasoning now streams live into a hidden drawer to keep the UI clean.
+- **Discord Instant Registration**: Added support for `DISCORD_GUILD_ID` for instant slash command updates (bypasses the 1-hour global propagation delay).
+
+#### Fixed
+
+- **Reasoning Persistence**: Optimized the engine to save agent thoughts in `<think>` tags, ensuring reasoning blocks survive page refreshes.
+- **UI Glitch**: Fixed a regression where word-by-word reasoning streams would split into dozens of separate boxes.
+- **Metrics Accuracy**: Updated metrics to include the reasoning time and tokens in the final `tok/s` calculation.
+
 ### [0.3.1] - 2026-04-21
 
 #### Added
 
-- Finalized robust WhatsApp **Lid (Linked ID)** detection support, enabling accurate bot identification in privacy-focused groups where phone numbers are hidden.
-- Added **informal mention detection** for WhatsApp; the bot now responds to direct name-based summons (e.g., "molty help") even without an explicit `@` tag.
-- Implemented recursive message unwrapping to handle ephemeral and view-once WhatsApp message containers.
+- Finalized robust WhatsApp **Lid (Linked ID)** detection support for privacy-focused groups.
+- Added **informal mention detection** for WhatsApp summons (e.g., "molty help").
+- Implemented recursive message unwrapping for ephemeral/view-once WhatsApp containers.
 
 #### Fixed
 
-- Fixed JID normalization logic in WhatsApp to strip device and domain suffixes for consistent matching against both phone JIDs and Linked IDs.
-
-### [0.3.0] - 2026-04-21
-
-#### Added
-
-- Added Discord `/tokens` slash command to view real-time session context usage and compaction threshold remaining.
-- Added dynamic LLM inference capability discovery: `autoDetect` queries `/v1/models` against your local OpenAI-compatible server at boot.
-- The Discord `/model` command now actively pulls the live pool of available models across all configured servers, displaying context window sizes and vision flags natively evaluated.
-
-#### Changed
-
-- Hardened the ReAct loop engine by adding three strict circuit breakers (consecutive failures, redundant calls, and pre-emptive substantial answers) forcing tool shedding to preserve inference stability.
-
-#### Fixed
-
-- Fixed WhatsApp group chat tagging bug failing due to unrecognized device JID suffixes (`user:10@s.whatsapp.net`). Mention regex normalizer added.
-- Fixed Discord mention stripping logic where `message.content` was deleting `<@123>` tags instead of replacing them intelligently with actual `@user` handles before feeding the LLM.
-- Fixed an inference edge-case where `auto` detection timeouts led to a fallback dropping the Google endpoint to the standard OpenAI URL resulting in 401 API Key Errors.
-
-### [0.2.0] - 2026-04-20
-
-#### Added
-
-- Fresh, lightweight **OpenClaw-style WebUI overhaul** with a responsive slim sidebar interface.
-- Distinctly aligned message bubbles in WebUI: user right-aligned (accented), assistant left-aligned.
-- Native injection of `{{STATE_DIR}}` into system prompts for robust agent workspace awareness.
-
-#### Changed
-
-- **Privacy-First Personality**: Personalized files in `config/personality/` are now git-ignored. Added `*.template.md` files for repo consistency—copy them to `.md` to customize your bot's soul without leaking it to GitHub.
-- **Dynamic Name Logic**: Added `agent.name` to `config.yaml`. Use this to set your bot's callsign (e.g., "Molty Bot") for reliable @mention detection across all channels.
-- **WhatsApp Group Context**: Messages in group chats are now saved to memory silently even when you don't tag the bot, so it has context when you finally address it.
-- **Configurable History**: Added `agent.historyMessageLimit` to `config.yaml` to control how many previous messages are sent to the LLM (default: 20).
-- **Response Formatting**: Added strict constraints to `system_prompt.md` to prevent "internal monologue" or action-narration spam (no more `(Thinking...)` text).
-- Replaced noisy JSON metadata blocks in Discord and WhatsApp with a compact, minimal-token context header.
-- Streamlined agent tagging logic to only tag when contextually relevant instead of blanket-tagging every reply.
-- Agent identity now gracefully extracts Discord/WhatsApp sender handles for WebUI display instead of defaulting to generic 'You'.
-
-#### Fixed
-
-- Fixed aggressive infinite loops related to the web search tool by tightening the engine's tool-repair heuristic.
-- Fixed `[object Object]` bug when restoring message chat history in the WebUI.
-- Fixed ghosts diffs and execution failures tied to permissions/ghost line endings in `skills`.
-
-### [0.1.0] - 2026-04-12
-
-#### Added
-
-- Initial LiteClaw runtime with WebUI, Discord, and WhatsApp support
-- Core tools for filesystem access, shell execution, web search/fetch, and native vision
-- Cross-channel confirmation handling for destructive actions
-- Project-level skills support with selective injection
-- Imported bundled `docx` and `pdf` skills plus a native Discord interactive chat skill
-- Reply-context support for Discord and WhatsApp
-- WebUI config editing, workspace support, and config reload signaling
-- GitHub repository hygiene files including `.gitignore`, `LICENSE`, `SECURITY.md`, and `CONTRIBUTING.md`
-
-#### Changed
-
-- Improved tool-call recovery for smaller local models
-- Improved multimodal handling so images are processed natively instead of relying on a fake `describe_image` tool
-- Hid tool progress/results by default in Discord and WhatsApp while preserving them for WebUI
-- Added rapid reply style support for Discord and WhatsApp
-- Improved group-chat context by injecting compact sender and participant metadata
-- Added native retrieval-style tool guidance so only relevant tool instructions are injected for a turn
-
-#### Fixed
-
-- Fixed broken XML-style tool-call parsing paths
-- Fixed multi-step tool-call continuation for weaker models
-- Fixed Discord presence getting stuck instead of returning to idle
-- Fixed Discord attachment handling when image content types are missing
-- Fixed reply-context loss in channel chats
-- Reduced small-model bias toward useless directory listing loops
+- Fixed JID normalization logic in WhatsApp to strip device suffixes for consistent matching.
 
 ## Features
 
