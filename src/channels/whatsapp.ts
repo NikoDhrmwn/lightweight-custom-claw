@@ -536,11 +536,16 @@ function didMentionMe(messageContent: any, selfJid?: string): boolean {
     messageContent?.videoMessage?.contextInfo ??
     messageContent?.documentMessage?.contextInfo;
 
-  const mentioned = contextInfo?.mentionedJid ?? [];
-  const matched = mentioned.includes(selfJid);
+  const mentioned: string[] = contextInfo?.mentionedJid ?? [];
+  
+  // Normalize JIDs: strip device suffix (e.g., "123:10@s.whatsapp.net" → "123@s.whatsapp.net")
+  const normalizeJid = (jid: string) => jid.replace(/:\d+@/, '@');
+  const normalizedSelf = normalizeJid(selfJid);
+  
+  const matched = mentioned.some(m => normalizeJid(m) === normalizedSelf);
   
   if (!matched && mentioned.length > 0) {
-    log.debug({ selfJid, mentioned }, 'No JID match in mentions');
+    log.debug({ selfJid, normalizedSelf, mentioned }, 'No JID match in mentions');
   }
   
   return matched;
