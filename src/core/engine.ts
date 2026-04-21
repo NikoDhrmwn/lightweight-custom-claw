@@ -70,6 +70,13 @@ export class AgentEngine extends EventEmitter {
     this.confirmations = confirmations;
   }
 
+  /**
+   * Get the underlying LLM client.
+   */
+  getLLMClient(): LLMClient {
+    return this.llm;
+  }
+
   private async acquireLock(sessionKey: string): Promise<() => void> {
     const currentLock = this.sessionLocks.get(sessionKey) || Promise.resolve();
     let release!: () => void;
@@ -198,7 +205,9 @@ export class AgentEngine extends EventEmitter {
     // 9. ReAct loop
     let iterations = 0;
     let repairAttempts = 0;
+    let consecutiveFailures = 0;
     let fullResponse = '';
+    const toolCallHistory = new Set<string>(); // Track "toolName:argsHash" to prevent duplicates
 
     while (iterations < maxIterations) {
       iterations++;
@@ -255,21 +264,29 @@ export class AgentEngine extends EventEmitter {
 
       // If no tool calls, we're done — unless the model stalled after planning.
       if (toolCalls.length === 0) {
-        if (!assistantContent.trim() && shouldRepairToolTurn(request.message, thinkingContent, toolDefs) && repairAttempts < 2) {
-          repairAttempts++;
-          messages.push({
-            role: 'user',
-            content: 'You stopped after planning. Do not explain your plan. Either emit exactly one <tool_call> block now, or answer directly if no tool is needed.',
-          });
-          continue;
-        }
-
         if (!assistantContent.trim() && thinkingContent.trim()) {
-          yield {
-            type: 'error',
-            error: 'Model stopped after planning but did not provide a tool call or final answer.',
-          };
-          return;
+          if (repairAttempts < 2) {
+            repairAttempts++;
+            log.warn('Model stopped after planning without action. Triggering safety net retry.');
+            
+            // Modify the last message instead of appending a new conversational turn
+            // This prevents context blooming across multiple retries
+            const lastMsg = messages.pop();
+            if (lastMsg) {
+              let newContent = typeof lastMsg.content === 'string' ? lastMsg.content : lastMsg.content[0].text;
+              messages.push({
+                ...lastMsg,
+                content: `${newContent}\n\n[SYSTEM REPAIR: Your previous attempt stalled after planning. Do not narrate. Emit exactly one <tool_call> block now, or provide the final answer if no tool is needed.]`
+              });
+            }
+            continue;
+          } else {
+            yield {
+              type: 'error',
+              error: 'Model reached stagnation after multiple planning attempts without action.',
+            };
+            return;
+          }
         }
 
         fullResponse = assistantContent;
@@ -278,15 +295,45 @@ export class AgentEngine extends EventEmitter {
 
       repairAttempts = 0;
 
+      // ── Guard 1: Duplicate tool call rejection ──
+      // Prevent the model from calling the same tool with identical args twice.
+      const deduped: LLMToolCall[] = [];
+      for (const tc of toolCalls) {
+        const sig = `${tc.function.name}:${tc.function.arguments}`;
+        if (toolCallHistory.has(sig)) {
+          log.warn({ tool: tc.function.name }, 'Duplicate tool call detected, skipping');
+          continue;
+        }
+        toolCallHistory.add(sig);
+        deduped.push(tc);
+      }
+
+      // If ALL calls were duplicates, treat it as "no tool calls" and finalize.
+      if (deduped.length === 0) {
+        log.warn('All tool calls were duplicates. Finalizing response.');
+        fullResponse = assistantContent;
+        break;
+      }
+
+      // ── Guard 2: Substantial-answer early exit ──
+      // If the model already produced a meaningful text answer AND is now
+      // trying to do more tool calls, stop the loop. The answer is done.
+      if (assistantContent.trim().length > 200 && iterations > 1) {
+        log.info('Model produced substantial content alongside tool calls. Finalizing response.');
+        fullResponse = assistantContent;
+        break;
+      }
+
       // Add assistant's tool call message to conversation
       messages.push({
         role: 'assistant',
         content: assistantContent || '',
-        tool_calls: toolCalls,
+        tool_calls: deduped,
       });
 
       // Execute tool calls
-      for (const tc of toolCalls) {
+      let iterationFailures = 0;
+      for (const tc of deduped) {
         yield {
           type: 'tool_start',
           toolName: tc.function.name,
@@ -314,12 +361,34 @@ export class AgentEngine extends EventEmitter {
 
         yield { type: 'tool_result', toolName: tc.function.name, toolResult: result };
 
+        if (!result.success) iterationFailures++;
+
         // Add tool result to conversation
         messages.push({
           role: 'tool',
           tool_call_id: tc.id,
           content: formatToolResultForModel(tc.function.name, result),
         });
+      }
+
+      // ── Guard 3: Consecutive failure circuit breaker ──
+      // If every tool call in this iteration failed, increment the counter.
+      // After 3 consecutive all-fail iterations, force the model to answer directly.
+      if (iterationFailures === deduped.length) {
+        consecutiveFailures++;
+        log.warn({ consecutiveFailures }, 'All tool calls failed this iteration');
+        if (consecutiveFailures >= 3) {
+          log.warn('Circuit breaker tripped: 3 consecutive all-fail tool iterations. Forcing direct answer.');
+          messages.push({
+            role: 'user',
+            content: '[SYSTEM: All recent tool attempts have failed. Do NOT call any more tools. Provide your best answer directly based on what you already know.]',
+          });
+          // Let the model try one more iteration with no tools
+          toolDefs.length = 0;
+          continue;
+        }
+      } else {
+        consecutiveFailures = 0;
       }
 
       // Trim context again after tool results
@@ -399,21 +468,42 @@ function extractEmbeddedToolCalls(
   for (const source of sources) {
     if (!source) continue;
 
-    const matches = source.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g);
-    for (const match of matches) {
-      try {
-        const parsed = JSON.parse(match[1]);
-        if (!parsed?.name || !toolNames.has(parsed.name)) continue;
-        calls.push({
-          id: `embedded_${Date.now()}_${calls.length}`,
-          type: 'function',
-          function: {
-            name: parsed.name,
-            arguments: JSON.stringify(parsed.arguments ?? {}),
-          },
-        });
-      } catch {
-        // Ignore malformed embedded blocks; the normal error path will handle it.
+    // 1. Standard XML Tags: <tool_call>{"name": "...", "arguments": {}}</tool_call>
+    const xmlRegex = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+    // 2. Gemma Native Format: <|tool_call|>call: {"name": "...", "arguments": {}}
+    const nativeRegex = /<\|tool_call\|>call:\s*({[\s\S]*?})(?:\n|$)/g;
+    const nativeRegexAlternate = /<\|tool_call>call:\s*({[\s\S]*?})(?:\n|$)/g;
+    // 3. Markdowns or raw JSON blocks: ```json ... ``` or just { ... }
+    const jsonBlockRegex = /```(?:json)?\s*({[\s\S]*?})\s*```/g;
+
+    const matchers = [
+      { regex: xmlRegex, group: 1 },
+      { regex: nativeRegex, group: 1 },
+      { regex: nativeRegexAlternate, group: 1 },
+      { regex: jsonBlockRegex, group: 1 }
+    ];
+
+    for (const { regex, group } of matchers) {
+      const matches = source.matchAll(regex);
+      for (const match of matches) {
+        try {
+          const rawJson = match[group].trim();
+          const parsed = JSON.parse(rawJson);
+          
+          if (parsed?.name && toolNames.has(parsed.name)) {
+            // Check for duplicates
+            const argsStr = JSON.stringify(parsed.arguments ?? {});
+            if (!calls.some(c => c.function.name === parsed.name && c.function.arguments === argsStr)) {
+              calls.push({
+                id: `embedded_${Date.now()}_${calls.length}`,
+                type: 'function',
+                function: { name: parsed.name, arguments: argsStr },
+              });
+            }
+          }
+        } catch {
+          // Inner JSON might be partial or malformed, skip
+        }
       }
     }
   }
@@ -422,31 +512,14 @@ function extractEmbeddedToolCalls(
 }
 
 function stripEmbeddedToolCalls(text: string): string {
-  return text.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, '').trim();
+  let stripped = text;
+  stripped = stripped.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '');
+  stripped = stripped.replace(/<\|tool_call\|?>call:[\s\S]*?(?:\n|$)/g, '');
+  stripped = stripped.replace(/```(?:json)?\s*{[\s\S]*?}\s*```/g, '');
+  return stripped.trim();
 }
 
-function shouldRepairToolTurn(
-  userMessage: string,
-  thinkingContent: string,
-  toolDefs: Array<{ function: { name: string } }>
-): boolean {
-  if (toolDefs.length === 0) return false;
 
-  // Only repair if the thinking text explicitly mentions a tool name from the active set.
-  // Previously this matched broad keywords like 'search', 'read', 'run' which caused
-  // the agent to spam-loop when tools returned unhelpful results.
-  const thinking = thinkingContent.toLowerCase();
-  const toolMentioned = toolDefs.some(td => thinking.includes(td.function.name.toLowerCase()));
-
-  // Also check for explicit "I will use" or "tool_call" patterns in thinking
-  const hasExplicitIntent =
-    thinking.includes('i will use') ||
-    thinking.includes('tool_call') ||
-    thinking.includes('i need to call') ||
-    thinking.includes('let me use the');
-
-  return toolMentioned || hasExplicitIntent;
-}
 
 function inferSafeToolCall(
   thinkingContent: string,

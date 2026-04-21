@@ -95,7 +95,12 @@ export class WhatsAppChannel {
       }
 
       if (connection === 'open') {
-        log.info('WhatsApp connected');
+        const me = (this.sock as any)?.authState?.creds?.me || {};
+        log.info({ 
+          id: this.sock?.user?.id, 
+          lid: (this.sock?.user as any)?.lid,
+          credsMe: me
+        }, 'WhatsApp connected - Identity Details');
         printStepDone('WhatsApp connected');
       }
     });
@@ -105,15 +110,15 @@ export class WhatsAppChannel {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        if (msg.key.fromMe) continue;
-        if (!msg.message) continue;
+        const unwrapped = unwrapMessage(msg.message);
+        if (!unwrapped) continue;
 
-        await this.handleMessage(msg);
+        await this.handleMessage(msg, unwrapped);
       }
     });
   }
 
-  private async handleMessage(msg: any): Promise<void> {
+  private async handleMessage(msg: any, messageContent: any): Promise<void> {
     const jid = msg.key.remoteJid!;
 
     // Check allow policy
@@ -127,7 +132,6 @@ export class WhatsAppChannel {
 
     // Extract text content
     let content = '';
-    const messageContent = msg.message;
 
     if (messageContent?.conversation) {
       content = messageContent.conversation;
@@ -137,7 +141,7 @@ export class WhatsAppChannel {
       content = messageContent.imageMessage.caption;
     }
 
-    const mentionTargets = this.extractMentionTargets(msg);
+    const mentionTargets = this.extractMentionTargets(msg, messageContent);
     const replyContext = this.extractReplyContext(messageContent);
 
     // Handle image messages (native multimodal)
@@ -196,21 +200,27 @@ export class WhatsAppChannel {
     const isGroupChat = jid.endsWith('@g.us');
     if (isGroupChat) {
       const selfJidRaw = this.sock?.user?.id || '';
+      const selfLid = (this.sock?.user as any)?.lid || (this.sock as any)?.authState?.creds?.me?.lid || '';
       const selfJid = selfJidRaw.split(':')[0] + '@s.whatsapp.net';
       const myName = this.config.agent?.name || this.sock?.user?.name || 'Molty';
       
+      const namePattern = new RegExp(`\\b${escapeRegex(myName)}\\b`, 'i');
       const isMentioned = didMentionMe(messageContent, selfJid) || 
                           didMentionMe(messageContent, selfJidRaw) ||
-                          content.toLowerCase().includes(`@${myName.toLowerCase()}`);
-                          
+                          (selfLid && didMentionMe(messageContent, selfLid)) ||
+                          content.toLowerCase().includes(`@${myName.toLowerCase()}`) ||
+                          namePattern.test(content); // Handle informal mentions like "oi molty"
+                           
       const isReplyToMe = messageContent?.extendedTextMessage?.contextInfo?.participant === selfJid ||
-                          messageContent?.extendedTextMessage?.contextInfo?.participant === selfJidRaw;
+                          messageContent?.extendedTextMessage?.contextInfo?.participant === selfJidRaw ||
+                          (selfLid && normalizeJid(messageContent?.extendedTextMessage?.contextInfo?.participant || '') === normalizeJid(selfLid));
       
-      log.debug({ 
+      log.info({ 
         isGroupChat, isMentioned, isReplyToMe, 
-        selfJid, selfJidRaw,
+        selfJid, selfLid, myName,
+        exactText: content,
         mentionedJids: messageContent?.extendedTextMessage?.contextInfo?.mentionedJid 
-      }, 'WhatsApp group filter check');
+      }, 'WhatsApp group filter check VERY VERBOSE');
 
       if (!isMentioned && !isReplyToMe) {
         this.engine.saveMessageSilent(request);
@@ -329,9 +339,8 @@ export class WhatsAppChannel {
     }
   }
 
-  private extractMentionTargets(msg: any): MentionTarget[] {
+  private extractMentionTargets(msg: any, messageContent: any): MentionTarget[] {
     const jid = msg.key.remoteJid!;
-    const messageContent = msg.message;
     const contextInfo =
       messageContent?.extendedTextMessage?.contextInfo ??
       messageContent?.imageMessage?.contextInfo ??
@@ -484,10 +493,6 @@ function chunkText(text: string, maxLen: number): string[] {
   return chunks;
 }
 
-function buildEffectiveIncomingMessage(replyContext: string | null, content: string): string {
-  return replyContext ? `${replyContext}\n\nUser reply: ${content}` : content;
-}
-
 function buildStructuredIncomingMessage(
   meta: {
     conversationLabel: string;
@@ -528,22 +533,51 @@ function formatReplyContext(author: string, content: string): string {
   return `[Reply context]\n${author}: ${content}\n[/Reply context]`;
 }
 
-function didMentionMe(messageContent: any, selfJid?: string): boolean {
-  if (!selfJid) return false;
+// Normalize JIDs: strip device suffix (e.g., "123:10") 
+// and handle @s.whatsapp.net, @c.us, and @lid consistently
+function normalizeJid(id: string): string {
+  if (!id) return '';
+  // Strip domain and device IDs
+  return id.split(':')[0].split('@')[0];
+}
+
+function didMentionMe(messageContent: any, selfId?: string): boolean {
+  if (!selfId) return false;
+  
   const contextInfo =
     messageContent?.extendedTextMessage?.contextInfo ??
     messageContent?.imageMessage?.contextInfo ??
     messageContent?.videoMessage?.contextInfo ??
     messageContent?.documentMessage?.contextInfo;
 
-  const mentioned = contextInfo?.mentionedJid ?? [];
-  const matched = mentioned.includes(selfJid);
+  const mentioned: string[] = contextInfo?.mentionedJid ?? [];
+  
+  const normalizedSelf = normalizeJid(selfId);
+  const matched = mentioned.some(m => normalizeJid(m) === normalizedSelf);
   
   if (!matched && mentioned.length > 0) {
-    log.debug({ selfJid, mentioned }, 'No JID match in mentions');
+    log.debug({ 
+      selfId, 
+      normalizedSelf, 
+      mentioned: mentioned.map(m => `${m} -> ${normalizeJid(m)}`) 
+    }, 'No ID match in mentions');
   }
   
   return matched;
+}
+
+/**
+ * Unwrap message content from Baileys wrappers (ephemeral, viewOnce, etc.)
+ */
+function unwrapMessage(msg: any): any {
+  if (!msg) return null;
+  
+  if (msg.ephemeralMessage) return unwrapMessage(msg.ephemeralMessage.message);
+  if (msg.viewOnceMessage) return unwrapMessage(msg.viewOnceMessage.message);
+  if (msg.viewOnceMessageV2) return unwrapMessage(msg.viewOnceMessageV2.message);
+  if (msg.viewOnceMessageV2Extension) return unwrapMessage(msg.viewOnceMessageV2Extension.message);
+  
+  return msg;
 }
 
 function createMentionTarget(id: string, ...labels: Array<string | undefined>): MentionTarget {

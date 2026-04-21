@@ -212,6 +212,9 @@ const SLASH_COMMANDS = [
   new SlashCommandBuilder()
     .setName('model')
     .setDescription('Show the current model and provider info'),
+  new SlashCommandBuilder()
+    .setName('tokens')
+    .setDescription('Show current session token usage and compaction threshold'),
 ];
 
 // ─── Discord Channel Class ───────────────────────────────────────────
@@ -465,6 +468,9 @@ export class DiscordChannel {
       case 'model':
         await this.handleModelCommand(interaction);
         break;
+      case 'tokens':
+        await this.handleTokensCommand(interaction);
+        break;
       default:
         await interaction.reply({ content: 'Unknown command.', ephemeral: true });
     }
@@ -631,22 +637,61 @@ export class DiscordChannel {
     await interaction.reply({ embeds: [embed] });
   }
 
-  private async handleModelCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async handleTokensCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const sessionKey = `discord:${interaction.channelId}`;
+    const { MemoryStore } = await import('../core/memory.js');
+    const { ContextManager, estimateMessageTokens } = await import('../core/context.js');
+    
+    const memory = new MemoryStore();
+    const history = memory.getHistory(sessionKey, 100);
+    memory.close();
+
     const config = getConfig();
-    const providers = config.llm?.providers ?? {};
-    const primary = config.llm?.defaults?.primary ?? 'unknown';
+    const maxTokens = config.agent?.contextTokens ?? 64000;
+    const threshold = config.agent?.compaction?.softThresholdTokens ?? 48000;
+    
+    // Estimate tokens for current history
+    let currentTokens = 0;
+    for (const msg of history) {
+      // Fake a minimal LLMMessage since MemoryEntry has what we need
+      currentTokens += estimateMessageTokens({
+        role: msg.role as any,
+        content: msg.content
+      });
+    }
+
+    const percentage = Math.round((currentTokens / threshold) * 100);
+    let statusEmoji = '🟢';
+    if (percentage > 90) statusEmoji = '🔴';
+    else if (percentage > 75) statusEmoji = '🟡';
+
+    const embed = new EmbedBuilder()
+      .setTitle('📊 Context Tokens')
+      .setDescription(`Current session in this channel.`)
+      .addFields(
+        { name: 'Estimated Usage', value: `${currentTokens.toLocaleString()} tokens`, inline: true },
+        { name: 'Compaction Threshold', value: `${threshold.toLocaleString()} tokens`, inline: true },
+        { name: 'System Max', value: `${maxTokens.toLocaleString()} tokens`, inline: true },
+        { name: 'Status', value: `${statusEmoji} **${percentage}%** to compaction`, inline: false }
+      )
+      .setColor(0x6c63ff);
+
+    await interaction.reply({ embeds: [embed] });
+  }
+
+  private async handleModelCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const providers = this.engine.getLLMClient().getAllProviders();
+    const activeProvider = this.engine.getLLMClient().getProviders()[0];
+    const primaryId = activeProvider?.id ?? 'unknown';
 
     const fields: { name: string; value: string; inline: boolean }[] = [];
-    for (const [provId, prov] of Object.entries(providers)) {
-      const p = prov as any;
-      for (const model of p.models ?? []) {
-        const isPrimary = `${provId}/${model.id}` === primary;
-        fields.push({
-          name: `${isPrimary ? '★ ' : ''}${provId}/${model.id}`,
-          value: `Context: ${model.contextWindow ?? '?'} | Vision: ${model.vision ? '✅' : '❌'}`,
-          inline: true,
-        });
-      }
+    for (const p of providers) {
+      const isPrimary = p.id === primaryId;
+      fields.push({
+        name: `${isPrimary ? '★ ' : ''}${p.id}`,
+        value: `Context: ${p.contextWindow} | Vision: ${p.supportsVision ? '✅' : '❌'}`,
+        inline: true,
+      });
     }
 
     const embed = new EmbedBuilder()
@@ -688,12 +733,27 @@ export class DiscordChannel {
 
     if (!isMentioned && !isDM) return;
 
-    // Remove mention from content
-    let content = message.content.replace(/<@!?\d+>/g, '').trim();
+    // Replace Discord mentions with readable string formats (@username) before sending to LLM.
+    // Instead of stripping `<@123>`, we map it to `@username`.
+    let content = message.content;
+    const mentionTargets: MentionTarget[] = buildDiscordMentionTargetsFromMessage(message);
+
+    for (const target of mentionTargets) {
+      if (target.id === this.client.user?.id) continue;
+      // Also catch role mentions, we'll just leave string variants.
+      const pattern = new RegExp(`<@!?${target.id}>`, 'g');
+      content = content.replace(pattern, `@${target.label}`);
+    }
+
+    // Strip out the bot's own mention
+    if (this.client.user) {
+       const selfPattern = new RegExp(`<@!?${this.client.user.id}>`, 'g');
+       content = content.replace(selfPattern, '').trim();
+    }
+
     if (!content && message.attachments.size === 0) return;
 
     const replyContext = await this.buildReplyContext(message);
-    const mentionTargets = buildDiscordMentionTargetsFromMessage(message);
     const effectiveMessage = buildStructuredIncomingMessage(
       {
         platform: 'discord',
