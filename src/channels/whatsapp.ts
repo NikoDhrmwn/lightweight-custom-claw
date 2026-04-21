@@ -95,7 +95,12 @@ export class WhatsAppChannel {
       }
 
       if (connection === 'open') {
-        log.info('WhatsApp connected');
+        const me = (this.sock as any)?.authState?.creds?.me || {};
+        log.info({ 
+          id: this.sock?.user?.id, 
+          lid: (this.sock?.user as any)?.lid,
+          credsMe: me
+        }, 'WhatsApp connected - Identity Details');
         printStepDone('WhatsApp connected');
       }
     });
@@ -186,25 +191,29 @@ export class WhatsAppChannel {
       channelType: 'whatsapp',
       channelTarget: jid,
       userIdentifier: msg.pushName || jid.split('@')[0],
+      sendFile: async (filePath: string, fileName?: string) => {
+        await this.sendFile(jid, filePath, fileName);
+      },
     };
 
     // Ignore group chat messages unless mentioned or replied to (but save to memory for context)
     const isGroupChat = jid.endsWith('@g.us');
     if (isGroupChat) {
       const selfJidRaw = this.sock?.user?.id || '';
-      const selfLid = (this.sock?.user as any)?.lid || ''; // Handle Lid for privacy groups
+      const selfLid = (this.sock?.user as any)?.lid || (this.sock as any)?.authState?.creds?.me?.lid || '';
       const selfJid = selfJidRaw.split(':')[0] + '@s.whatsapp.net';
       const myName = this.config.agent?.name || this.sock?.user?.name || 'Molty';
       
+      const namePattern = new RegExp(`\\b${escapeRegex(myName)}\\b`, 'i');
       const isMentioned = didMentionMe(messageContent, selfJid) || 
                           didMentionMe(messageContent, selfJidRaw) ||
                           (selfLid && didMentionMe(messageContent, selfLid)) ||
                           content.toLowerCase().includes(`@${myName.toLowerCase()}`) ||
-                          content.toLowerCase().startsWith(myName.toLowerCase()); // Handle "molty hello"
+                          namePattern.test(content); // Handle informal mentions like "oi molty"
                            
       const isReplyToMe = messageContent?.extendedTextMessage?.contextInfo?.participant === selfJid ||
                           messageContent?.extendedTextMessage?.contextInfo?.participant === selfJidRaw ||
-                          (selfLid && messageContent?.extendedTextMessage?.contextInfo?.participant === selfLid);
+                          (selfLid && normalizeJid(messageContent?.extendedTextMessage?.contextInfo?.participant || '') === normalizeJid(selfLid));
       
       log.info({ 
         isGroupChat, isMentioned, isReplyToMe, 
@@ -484,10 +493,6 @@ function chunkText(text: string, maxLen: number): string[] {
   return chunks;
 }
 
-function buildEffectiveIncomingMessage(replyContext: string | null, content: string): string {
-  return replyContext ? `${replyContext}\n\nUser reply: ${content}` : content;
-}
-
 function buildStructuredIncomingMessage(
   meta: {
     conversationLabel: string;
@@ -528,8 +533,16 @@ function formatReplyContext(author: string, content: string): string {
   return `[Reply context]\n${author}: ${content}\n[/Reply context]`;
 }
 
-function didMentionMe(messageContent: any, selfJid?: string): boolean {
-  if (!selfJid) return false;
+// Normalize JIDs: strip device suffix (e.g., "123:10") 
+// and handle @s.whatsapp.net, @c.us, and @lid consistently
+function normalizeJid(id: string): string {
+  if (!id) return '';
+  // Strip domain and device IDs
+  return id.split(':')[0].split('@')[0];
+}
+
+function didMentionMe(messageContent: any, selfId?: string): boolean {
+  if (!selfId) return false;
   
   const contextInfo =
     messageContent?.extendedTextMessage?.contextInfo ??
@@ -539,22 +552,15 @@ function didMentionMe(messageContent: any, selfJid?: string): boolean {
 
   const mentioned: string[] = contextInfo?.mentionedJid ?? [];
   
-  // Normalize JIDs: strip device suffix (e.g., "123:10" → "123") 
-  // and handle both @s.whatsapp.net and @c.us consistently
-  const normalizeJid = (jid: string) => {
-    if (!jid) return '';
-    return jid.split(':')[0].split('@')[0];
-  };
-
-  const normalizedSelf = normalizeJid(selfJid);
+  const normalizedSelf = normalizeJid(selfId);
   const matched = mentioned.some(m => normalizeJid(m) === normalizedSelf);
   
   if (!matched && mentioned.length > 0) {
     log.debug({ 
-      selfJid, 
+      selfId, 
       normalizedSelf, 
       mentioned: mentioned.map(m => `${m} -> ${normalizeJid(m)}`) 
-    }, 'No JID match in mentions');
+    }, 'No ID match in mentions');
   }
   
   return matched;

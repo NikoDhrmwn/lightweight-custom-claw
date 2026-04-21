@@ -11,6 +11,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [0.3.1] - 2026-04-21
+
+#### Added
+
+- Finalized robust WhatsApp **Lid (Linked ID)** detection support, enabling accurate bot identification in privacy-focused groups where phone numbers are hidden.
+- Added **informal mention detection** for WhatsApp; the bot now responds to direct name-based summons (e.g., "molty help") even without an explicit `@` tag.
+- Implemented recursive message unwrapping to handle ephemeral and view-once WhatsApp message containers.
+
+#### Fixed
+
+- Fixed JID normalization logic in WhatsApp to strip device and domain suffixes for consistent matching against both phone JIDs and Linked IDs.
+
 ### [0.3.0] - 2026-04-21
 
 #### Added
