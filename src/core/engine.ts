@@ -31,9 +31,15 @@ import { toolRegistry, ToolContext, ToolDefinition, ToolResult } from './tools.j
 
 const log = createLogger('engine');
 
+export interface AgentAttachment {
+  name: string;
+  dataUrl: string;
+}
+
 export interface AgentRequest {
   message: string;
   images?: string[];
+  attachments?: AgentAttachment[];
   sessionKey: string;
   channelType: 'webui' | 'discord' | 'whatsapp' | 'cli';
   channelTarget?: string;
@@ -50,7 +56,7 @@ export interface MessageMetrics {
 }
 
 export interface AgentStreamEvent {
-  type: 'thinking' | 'content' | 'tool_start' | 'tool_result' | 'confirmation' | 'plan' | 'task_update' | 'done' | 'error';
+  type: 'thinking' | 'content' | 'tool_start' | 'tool_result' | 'confirmation' | 'plan' | 'task_update' | 'done' | 'error' | 'switch_to_plan';
   content?: string;
   toolName?: string;
   toolArgs?: Record<string, any>;
@@ -108,6 +114,11 @@ type InternalFinalEvent =
 type InternalReplanEvent =
   | AgentStreamEvent
   | { type: 'replan_result'; result: ReplanResult | null };
+
+type InternalDirectEvent =
+  | AgentStreamEvent
+  | { type: 'final_result'; content: string }
+  | { type: 'switch_to_plan'; plan?: TaskPlan };
 
 export class AgentEngine extends EventEmitter {
   private llm: LLMClient;
@@ -178,45 +189,17 @@ export class AgentEngine extends EventEmitter {
     );
 
     if (!usePlanner) {
-      let finalResponse = '';
-      for await (const event of this.runDirectConversation(request, prepared)) {
-        if (event.type === 'final_result') {
-          finalResponse = event.content;
-          continue;
-        }
-
-        if (event.type === 'thinking' && event.content) {
-          totalTokens += estimateTokens(event.content);
-          allThinkingContent += event.content;
-        } else if (event.type === 'content' && event.content) {
-          totalTokens += estimateTokens(event.content);
+      let switchedToPlan = false;
+      for await (const event of this.runAndSaveDirectConversation(request, prepared, startTime, totalTokens, allThinkingContent)) {
+        if (event.type === 'switch_to_plan') {
+          switchedToPlan = true;
+          log.info({ session: request.sessionKey }, 'Model requested plan autonomously');
+          break; 
         }
         yield event;
       }
 
-      const contentToSave = allThinkingContent
-        ? `<think>${allThinkingContent}</think>${finalResponse}`
-        : finalResponse;
-
-      this.memory.saveMessage({
-        sessionKey: request.sessionKey,
-        role: 'assistant',
-        content: contentToSave,
-        timestamp: Date.now(),
-      });
-
-      const durationMs = Date.now() - startTime;
-      const tokPerSec = durationMs > 0 ? totalTokens / (durationMs / 1000) : 0;
-
-      yield {
-        type: 'done',
-        metrics: {
-          tokens: totalTokens,
-          durationMs,
-          tokPerSec,
-        },
-      };
-      return;
+      if (!switchedToPlan) return;
     }
 
     let plan: TaskPlan | null = null;
@@ -232,11 +215,23 @@ export class AgentEngine extends EventEmitter {
       }
     }
 
-    plan ??= createFallbackTaskPlan(
-      request.message,
-      prepared.selectedTools.map(tool => tool.name),
-      prepared.activeSkills.map(skill => skill.name),
-    );
+    if (!plan || plan.tasks.length === 0) {
+      // If the planner explicitly returned no tasks, or failed to return a plan,
+      // and we don't want a fallback, switch to direct conversation.
+      if (plan && plan.tasks.length === 0) {
+        for await (const event of this.runAndSaveDirectConversation(request, prepared, startTime, totalTokens, allThinkingContent)) {
+          yield event;
+        }
+        return;
+      }
+
+      plan = createFallbackTaskPlan(
+        request.message,
+        prepared.selectedTools.map(tool => tool.name),
+        prepared.activeSkills.map(skill => skill.name),
+      );
+    }
+
     plan.status = 'in_progress';
     plan.updatedAt = Date.now();
     this.memory.saveTaskPlan(request.sessionKey, plan);
@@ -354,6 +349,7 @@ export class AgentEngine extends EventEmitter {
     this.memory.saveTaskPlan(request.sessionKey, plan);
 
     let finalResponse = '';
+    let streamedFinalContent = false;
     for await (const event of this.generateFinalResponse(request, prepared, plan, failure, taskHints)) {
       if (event.type === 'final_result') {
         finalResponse = event.content;
@@ -365,12 +361,18 @@ export class AgentEngine extends EventEmitter {
         allThinkingContent += event.content;
       } else if (event.type === 'content' && event.content) {
         totalTokens += estimateTokens(event.content);
+        streamedFinalContent = true;
       }
       yield event;
     }
 
+    if (finalResponse.trim() && !streamedFinalContent) {
+      totalTokens += estimateTokens(finalResponse);
+      yield { type: 'content', content: finalResponse };
+    }
+
     const contentToSave = allThinkingContent
-      ? `<think>${allThinkingContent}</think>${finalResponse}`
+      ? `<think>${allThinkingContent}</think>\n\n${finalResponse}`
       : finalResponse;
 
     this.memory.saveMessage({
@@ -403,10 +405,37 @@ export class AgentEngine extends EventEmitter {
     const userMessage = this.buildUserMessage(request);
     const historyLimit = config.agent?.historyMessageLimit ?? 30;
     const rawHistory = this.memory.getHistory(request.sessionKey, historyLimit);
-    let history: LLMMessage[] = rawHistory.map(entry => ({
-      role: entry.role as 'user' | 'assistant',
-      content: entry.content,
-    }));
+    let history: LLMMessage[] = rawHistory.map(entry => {
+      const message: LLMMessage = {
+        role: entry.role as 'user' | 'assistant',
+        content: entry.content,
+      };
+
+      if (entry.role === 'user' && entry.metadata) {
+        try {
+          const meta = JSON.parse(entry.metadata);
+          // Restore images if they exist in metadata
+          if (meta.attachments || meta.images) {
+            const atts = meta.attachments || meta.images;
+            const content: any[] = [{ type: 'text', text: entry.content }];
+            for (const att of atts) {
+              const url = typeof att === 'string' ? att : att.dataUrl;
+              if (url.startsWith('data:image/')) {
+                content.push({
+                  type: 'image_url',
+                  image_url: { url, detail: 'auto' },
+                });
+              }
+            }
+            message.content = content;
+          }
+        } catch (e) {
+          log.warn({ id: entry.id }, 'Failed to parse message metadata during history restoration');
+        }
+      }
+
+      return message;
+    });
 
     if (this.context.shouldCompact(history)) {
       log.info({ session: request.sessionKey }, 'Triggering context compaction');
@@ -454,6 +483,60 @@ export class AgentEngine extends EventEmitter {
     };
   }
 
+  private async *runAndSaveDirectConversation(
+    request: AgentRequest,
+    prepared: PreparedRequestContext,
+    startTime: number,
+    totalTokens: number,
+    allThinkingContent: string,
+  ): AsyncGenerator<AgentStreamEvent> {
+    let finalResponse = '';
+    let streamedContent = false;
+    for await (const event of this.runDirectConversation(request, prepared)) {
+      if (event.type === 'final_result') {
+        finalResponse = event.content;
+        continue;
+      }
+
+      if (event.type === 'thinking' && event.content) {
+        totalTokens += estimateTokens(event.content);
+        allThinkingContent += event.content;
+      } else if (event.type === 'content' && event.content) {
+        totalTokens += estimateTokens(event.content);
+        streamedContent = true;
+      }
+      yield event;
+    }
+
+    if (finalResponse.trim() && !streamedContent) {
+      totalTokens += estimateTokens(finalResponse);
+      yield { type: 'content', content: finalResponse };
+    }
+
+    const contentToSave = allThinkingContent
+      ? `<think>${allThinkingContent}</think>\n\n${finalResponse}`
+      : finalResponse;
+
+    this.memory.saveMessage({
+      sessionKey: request.sessionKey,
+      role: 'assistant',
+      content: contentToSave,
+      timestamp: Date.now(),
+    });
+
+    const durationMs = Date.now() - startTime;
+    const tokPerSec = durationMs > 0 ? totalTokens / (durationMs / 1000) : 0;
+
+    yield {
+      type: 'done',
+      metrics: {
+        tokens: totalTokens,
+        durationMs,
+        tokPerSec,
+      },
+    };
+  }
+
   private async *runDirectConversation(
     request: AgentRequest,
     prepared: PreparedRequestContext,
@@ -474,7 +557,7 @@ export class AgentEngine extends EventEmitter {
       if (prepared.toolGuidance) {
         systemPrompt += `\n\n${prepared.toolGuidance}`;
       }
-      systemPrompt += `\n\nTo use a tool, output exactly this xml format:\n<tool_call>\n{"name": "tool_name", "arguments": {"param1": "value"}}\n</tool_call>\n\nCRITICAL: Always put your multi-step reasoning inside <think> tags before calling a tool. In the final response (outside tags), do NOT narrate your plan. No "I will now check...", no "I need to...". Emit the <tool_call> block immediately after your thoughts. Any text outside of <think> or <tool_call> tags while a tool is being used is forbidden.\n\nAfter emitting a tool call, you will receive a <tool_result> message. Use only ONE tool at a time.`;
+      systemPrompt += `\n\nTo use a tool, output exactly this xml format:\n<tool_call>\n{"name": "tool_name", "arguments": {"param1": "value"}}\n</tool_call>\n\nCRITICAL: Always put your multi-step reasoning inside <think> tags before calling a tool. In the final response (outside tags), do NOT narrate your plan. No "I will now check...", no "I need to...". Emit the <tool_call> block immediately after your thoughts. Any text outside of <think> or <tool_call> tags while a tool is being used is forbidden.\n\nAfter emitting a tool call, you will receive a <tool_result> message. Use only ONE tool at a time.\n\nFILE HANDLING:\n- When modifying existing files, PREFER the "edit_file" tool over "write_file".\n- Use "read_file" with "lineNumbers: true" for precise matching.\n- DO NOT try to read binary files (e.g., .docx, .pdf, .zip, images). If you need to "see" them, ask the user to describe them or use specialized tools if available.\n\nAUTONOMOUS PLANNING: If the task is complex and requires a multi-step structured plan, emit <request_plan reason="brief reason" /> to switch to planning mode.`;
     }
 
     const messages: LLMMessage[] = [
@@ -496,23 +579,30 @@ export class AgentEngine extends EventEmitter {
       const toolCalls: LLMToolCall[] = [];
 
       for await (const chunk of this.llm.streamChat(messages, toolDefs)) {
-        switch (chunk.type) {
-          case 'thinking':
-            if (chunk.content) yield { type: 'thinking', content: chunk.content };
-            thinkingContent += chunk.content ?? '';
-            break;
-          case 'content':
-            assistantContent += chunk.content ?? '';
-            yield { type: 'content', content: chunk.content };
-            break;
-          case 'tool_call':
-            if (chunk.toolCall) toolCalls.push(chunk.toolCall);
-            break;
-          case 'error':
-            yield { type: 'error', error: chunk.error };
-            yield { type: 'final_result', content: '' };
-            return;
+        if (chunk.type === 'thinking' && chunk.content) {
+          thinkingContent += chunk.content;
+          yield { type: 'thinking', content: chunk.content };
+        } else if (chunk.type === 'content' && chunk.content) {
+          assistantContent += chunk.content;
+        } else if (chunk.type === 'tool_call' && chunk.toolCall) {
+          toolCalls.push(chunk.toolCall);
+        } else if (chunk.type === 'error') {
+          yield { type: 'error', error: chunk.error };
+          return;
         }
+      }
+
+      const requestPlanMatch = assistantContent.match(/([\s\S]*?)<request_plan\b[\s\S]*?\/>/i);
+      if (requestPlanMatch) {
+        const preamble = requestPlanMatch[1]?.trim() ?? '';
+        if (preamble) {
+          yield {
+            type: isLikelyHiddenReasoning(preamble) ? 'thinking' : 'content',
+            content: preamble,
+          };
+        }
+        yield { type: 'switch_to_plan' };
+        return;
       }
 
       if (toolCalls.length === 0) {
@@ -526,6 +616,20 @@ export class AgentEngine extends EventEmitter {
       if (toolCalls.length === 0) {
         const inferred = inferSafeToolCall(thinkingContent, request.message, toolDefs);
         if (inferred) toolCalls.push(inferred);
+      }
+
+      if (toolCalls.length > 0 && assistantContent.trim()) {
+        const visible = stripEmbeddedToolCalls(assistantContent).trim();
+        if (visible) {
+          yield {
+            type: isLikelyHiddenReasoning(visible) ? 'thinking' : 'content',
+            content: visible,
+          };
+          if (isLikelyHiddenReasoning(visible)) {
+            thinkingContent += `\n${visible}`;
+          }
+          assistantContent = '';
+        }
       }
 
       if (toolCalls.length === 0) {
@@ -545,6 +649,9 @@ export class AgentEngine extends EventEmitter {
           return;
         }
 
+        if (assistantContent.trim()) {
+          yield { type: 'content', content: assistantContent };
+        }
         fullResponse = assistantContent;
         break;
       }
@@ -666,6 +773,7 @@ export class AgentEngine extends EventEmitter {
       'Keep the plan concise, sequential, and executable.',
       'Include suggestedTools only when genuinely useful and only from the available tools list.',
       'Include relevantSkills only when genuinely useful and only from the available skills list.',
+      'CRITICAL: If the user request is purely conversational, a simple greeting, informational, or does not require a multi-step plan (e.g., just a quick question that can be answered directly), return a plan with an EMPTY tasks list: {"summary":"Conversational response needed","tasks":[]}.',
       '',
       `Available tools: ${toolNames.join(', ') || 'none'}`,
       `Available skills: ${skillNames.join(', ') || 'none'}`,
@@ -754,6 +862,7 @@ If the current task is complete, blocked, or failed, emit exactly:
 </task_update>
 
 If you need more tools to reach the objective, emit a <tool_call> block.
+FILE EDITING: When modifying existing files, PREFER the "edit_file" tool over "write_file". This prevents accidental truncation. Use "read_file" with "lineNumbers: true" to get precise blocks for searching.
 Do not expose the internal plan outside tags.`;
 
     const completedTaskSummaries = plan.tasks
@@ -1182,6 +1291,7 @@ function buildRequestMetadata(request: AgentRequest): string | undefined {
   const metadata: Record<string, unknown> = {};
   if (request.userIdentifier) metadata.userIdentifier = request.userIdentifier;
   if (request.images?.length) metadata.imageCount = request.images.length;
+  if (request.attachments?.length) metadata.attachments = request.attachments;
   return Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : undefined;
 }
 
@@ -1207,10 +1317,28 @@ function extractEmbeddedToolCalls(
       { regex: /<tool_call>([\s\S]*?)<\/tool_call>/g, group: 1 },
       { regex: /<\|tool_call\|>call:\s*([a-z0-9_-]+)({[\s\S]*?})(?:<\/tool_call>|<tool_call\|>|(?:\n|$))/gi, group: 0, complex: true },
       { regex: /<\|tool_call>call:\s*([a-z0-9_-]+)({[\s\S]*?})(?:<\/tool_call>|<tool_call\|>|(?:\n|$))/gi, group: 0, complex: true },
+      { regex: /<tool_call>\s*(<function=[\s\S]*?<\/function>)\s*<\/tool_call>/gi, group: 1, functionStyle: true },
       { regex: /```(?:json)?\s*({[\s\S]*?})\s*```/g, group: 1 },
     ];
 
     for (const matcher of matchers) {
+      if ((matcher as any).functionStyle) {
+        const matches = source.matchAll(matcher.regex);
+        for (const match of matches) {
+          const parsed = parseFunctionStyleToolCall(match[matcher.group].trim());
+          if (!parsed?.name || !toolNames.has(parsed.name)) continue;
+          const argsStr = JSON.stringify(parsed.arguments ?? {});
+          if (!calls.some(call => call.function.name === parsed.name && call.function.arguments === argsStr)) {
+            calls.push({
+              id: `embedded_${Date.now()}_${calls.length}`,
+              type: 'function',
+              function: { name: parsed.name, arguments: argsStr },
+            });
+          }
+        }
+        continue;
+      }
+
       if (matcher.complex) {
         const matches = source.matchAll(matcher.regex);
         for (const match of matches) {
@@ -1272,7 +1400,9 @@ function stripEmbeddedToolCalls(text: string): string {
   return text
     .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
     .replace(/<\|tool_call\|?>[\s\S]*?(?:<\/tool_call>|<tool_call\|>|(?:\n|$))/gi, '')
+    .replace(/<tool_call>\s*<function=[\s\S]*?<\/function>\s*<\/tool_call>/gi, '')
     .replace(/```(?:json)?\s*{[\s\S]*?}\s*```/g, '')
+    .replace(/<\/?task_update>/gi, '')
     .trim();
 }
 
@@ -1296,6 +1426,35 @@ function safeParseToolArgs(raw: string): Record<string, any> {
     }
     return args;
   }
+}
+
+function parseFunctionStyleToolCall(raw: string): { name: string; arguments: Record<string, unknown> } | null {
+  const functionMatch = raw.match(/<function=([a-z0-9_-]+)>\s*([\s\S]*?)<\/function>/i);
+  if (!functionMatch) return null;
+
+  const name = functionMatch[1];
+  const body = functionMatch[2] ?? '';
+  const args: Record<string, unknown> = {};
+  const paramRegex = /<parameter=([a-z0-9_-]+)>\s*([\s\S]*?)\s*<\/parameter>/gi;
+
+  let match: RegExpExecArray | null;
+  while ((match = paramRegex.exec(body)) !== null) {
+    const key = match[1];
+    const rawValue = (match[2] ?? '').trim();
+
+    if (!rawValue) {
+      args[key] = '';
+      continue;
+    }
+
+    try {
+      args[key] = JSON.parse(rawValue);
+    } catch {
+      args[key] = rawValue;
+    }
+  }
+
+  return { name, arguments: args };
 }
 
 function inferSafeToolCall(
@@ -1382,11 +1541,16 @@ function shouldUseTaskPlanner(message: string, selectedTools: ToolDefinition[]):
   const lowered = message.toLowerCase().trim();
 
   if (!lowered) return false;
-  if (/^(hi|hello|hey|yo|sup|how are you|what's up|thanks|thank you)\b/.test(lowered)) {
+
+  // 1. Direct conversational bail-out for common greetings/reactions
+  const conversationalPrefixes = /^(hi|hello|hey|yo|sup|how are you|what's up|thanks|thank you|lol|lmao|bruh|omg|wow|cool|nice|ok|okay|yep|yeah|no|yes|nah|well|anyway|btw)\b/;
+  if (conversationalPrefixes.test(lowered) && lowered.split(/\s+/).length < 10) {
     return false;
   }
 
   const toolNames = new Set(selectedTools.map(tool => tool.name));
+
+  // 2. Detect strong "Task" intent (Explicit request for multi-step or complex operations)
   const multiStepSignals = [
     /\band then\b/,
     /\bthen\b/,
@@ -1396,31 +1560,78 @@ function shouldUseTaskPlanner(message: string, selectedTools: ToolDefinition[]):
     /\bfirst\b.*\bthen\b/,
     /\bnext\b/,
     /\bfinally\b/,
+    /\b(sequence|steps|list|plan|process|workflow)\b/,
   ];
 
-  const actionSignals = [
-    /\b(edit|update|modify|rewrite|create|generate|draft|prepare|fix|refactor|implement|build)\b/,
-    /\b(read|inspect|open|check|review|analyze|convert|extract)\b/,
-    /\b(send|share|attach|upload|deliver|post)\b/,
-    /\b(run|execute|install|search|fetch)\b/,
+  const complexActionSignals = [
+    /\b(implement|build|refactor|restructure|integrate|deploy|automate|rewrite|optimize)\b/,
+    /\b(research|analyze|investigate|evaluate|compare|audit)\b/,
+    /\b(create|generate|draft)\b.*\b(document|report|script|file|system|application)\b/,
   ];
 
-  const artifactSignals = [
-    /[a-z0-9._/-]+\.[a-z0-9]{2,6}\b/i,
-    /\b(docx|pdf|spreadsheet|word document|discord|whatsapp|file|folder|directory)\b/,
+  const operationalSignals = [
+    /\b(read|inspect|check|review|open)\b.*\b(all|multiple|every|each|files|directory|folder)\b/,
+    /\b(fix|update|modify|change)\b.*\b(everything|all cases|multiple places)\b/,
   ];
 
   let score = 0;
   if (multiStepSignals.some(pattern => pattern.test(lowered))) score += 3;
-  if (actionSignals.some(pattern => pattern.test(lowered))) score += 2;
-  if (artifactSignals.some(pattern => pattern.test(lowered))) score += 2;
-  if (/\b(search|find|research|look up|check prices|get prices|compare)\b/.test(lowered)) score += 2;
-  if (toolNames.has('send_file') && /\b(send|attach|upload|deliver)\b/.test(lowered)) score += 2;
-  if (toolNames.has('web_search') && /\b(search|find|price|latest)\b/.test(lowered)) score += 2;
-  if ((toolNames.has('write_file') || toolNames.has('exec')) && /\b(make|change|edit|fix|create|convert)\b/.test(lowered)) score += 1;
+  if (complexActionSignals.some(pattern => pattern.test(lowered))) score += 3;
+  if (operationalSignals.some(pattern => pattern.test(lowered))) score += 2;
 
-  const looksLikeQuestion = /\?$/.test(lowered) || /^(what|why|how|who|when|where|can you explain|tell me about)\b/.test(lowered);
-  if (looksLikeQuestion && score < 4) return false;
+  // Basic action signals (lower weight)
+  const basicActionSignals = [
+    /\b(edit|update|modify|fix|change|make)\b/,
+    /\b(search|find|fetch|look up|get|run|execute)\b/,
+  ];
+  if (basicActionSignals.some(pattern => pattern.test(lowered))) score += 1;
 
+  // Artifact signals (files, external platforms)
+  const artifactSignals = [
+    /\b[a-z0-9._/-]+\.[a-z0-9]{2,6}\b/i, // Matches filenames with extensions
+    /\b(docx|pdf|spreadsheet|word document|discord|whatsapp|file|folder|directory|repository|repo)\b/,
+  ];
+  if (artifactSignals.some(pattern => pattern.test(lowered))) score += 1;
+
+  // 3. Negative signals (Conversational / Non-Task)
+  const conversationalMarkers = [
+    /\b(dawg|bro|dude|man|lol|lmao|lmfao|joke|funny|fire|crazy|wild)\b/,
+    /\b(i think|i feel|i guess|maybe|just saying)\b/,
+    /\b(what do you think|your opinion|how about)\b/,
+  ];
+  if (conversationalMarkers.some(pattern => pattern.test(lowered))) score -= 2;
+
+  // 4. Final Decision
+  const isShort = lowered.length < 120;
+  const hasPlanKeywords = /\b(plan|steps|sequence)\b/.test(lowered);
+
+  // If it's a short message or conversational remark, avoid planning unless it specifically asks for a plan.
+  if (isShort && score < 4 && !hasPlanKeywords) {
+    return false;
+  }
+
+  // Threshold: 4 is a "complex" task
   return score >= 4;
+}
+
+function isLikelyHiddenReasoning(text: string): boolean {
+  const cleaned = text
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleaned) return false;
+
+  return [
+    /^i need to\b/i,
+    /^let me\b/i,
+    /^i(?:'|’)ll\b/i,
+    /^i will\b/i,
+    /^i should\b/i,
+    /^i(?:'|’)m going to\b/i,
+    /^first[, ]/i,
+    /^to answer this[, ]/i,
+    /\buse (?:the )?[a-z0-9_]+\b/i,
+    /\b(search|check|look up|inspect|compare|analyze|review|read|open|fetch)\b.+\b(first|before|then)\b/i,
+  ].some((pattern) => pattern.test(cleaned));
 }
