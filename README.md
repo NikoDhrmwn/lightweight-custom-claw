@@ -11,6 +11,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [0.4.0] - 2026-04-22
+
+#### Added
+
+- **Autonomous Task Planner**: Introduced a state-of-the-art planning system that breaks complex user requests into discrete, executable tasks.
+- **Task-Driven Execution Loop**: A new specialized loop for executing plan items, featuring strict structural enforcement and automatic "repair" nudges for local LLMs.
+- **Smart Research Heuristics**: Enhanced the engine's ability to automatically detect when a request (like price checking or web research) requires a multi-step plan.
+- **Discord Status Emojis**: Added planning progress tracking via Discord reactions (`🗺️`, `→`, `⚙`, `✓`, `X`).
+- **Auto-Build Workflow**: Streamlined the development process—`npm run dev` now automatically builds the project and synchronizes WebUI assets.
+
+#### Fixed
+
+- **Silent Model Stalling**: Implemented a fallback mechanism to prevent "(No response)" messages when models complete tool calls without providing a final verbal summary.
+- **Malformed JSON Recovery**: Added a robust, regex-backed JSON parser to the task engine to handle unquoted keys and common syntax errors from smaller models like Gemma 4.
+- **Empty Response Fallback**: The Discord channel now automatically displays tool progress if the model's verbal response is empty.
+
 ### [0.3.2] - 2026-04-21
 
 #### Added
@@ -25,26 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **UI Glitch**: Fixed a regression where word-by-word reasoning streams would split into dozens of separate boxes.
 - **Metrics Accuracy**: Updated metrics to include the reasoning time and tokens in the final `tok/s` calculation.
 
-### [0.3.1] - 2026-04-21
-
-#### Added
-
-- Finalized robust WhatsApp **Lid (Linked ID)** detection support for privacy-focused groups.
-- Added **informal mention detection** for WhatsApp summons (e.g., "molty help").
-- Implemented recursive message unwrapping for ephemeral/view-once WhatsApp containers.
-
-#### Fixed
-
-- Fixed JID normalization logic in WhatsApp to strip device suffixes for consistent matching.
-
 ## Features
 
-- Smart context management with lazy tool loading, compaction, and rolling history
-- WebUI, Discord, and WhatsApp channels
-- Core tools for filesystem access, command execution, web search/fetch, and native vision
-- Cross-channel confirmations for destructive actions
-- Project-level skills support with selective prompt injection
-- OpenClaw migration helpers
+- **Autonomous Task Planner**: Breaks down complex requests into multi-step executable plans (new in 0.4.0).
+- **Smart Context Management**: Lazy tool loading, compaction, and rolling history to stay within model context limits.
+- **Multi-Channel**: Native support for WebUI, Discord, and WhatsApp.
+- **Core Tools**: Filesystem access, command execution, web search/fetch, and native vision.
+- **Safety First**: Cross-channel confirmations for destructive or sensitive actions.
+- **Skills System**: Project-level skills support with selective prompt injection.
 
 ## Quick Start
 
