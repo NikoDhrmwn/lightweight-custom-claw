@@ -11,6 +11,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [0.5.0] - 2026-04-23
+
+#### Added
+
+- **Enhanced Search Engine**: Replaced Google Grounding with a custom, privacy-focused DuckDuckGo search integration utilizing Playwright for robust web results.
+- **Autonomous Multi-Step Planning**: The engine can now autonomously decide to enter "Plan Mode" to solve complex queries that require multiple tool calls.
+- **Real-Time WebUI Metrics**: Added live "Thinking" blocks and generation performance metrics (tok/s) to the WebUI for better transparency.
+- **Discord Reliability**: Implemented a state-tracking system to ensure Discord bot status correctly returns to "Idle" after task completion.
+
+#### Fixed
+
+- **Status Persistence**: Fixed a regression where the bot would remain stuck in "Thinking" or "Reading" state on Discord.
+- **Engine Stability**: Improved the structural enforcement of the task execution loop to prevent model stalling on local backends.
+
 ### [0.4.0] - 2026-04-22
 
 #### Added
@@ -27,23 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Malformed JSON Recovery**: Added a robust, regex-backed JSON parser to the task engine to handle unquoted keys and common syntax errors from smaller models like Gemma 4.
 - **Empty Response Fallback**: The Discord channel now automatically displays tool progress if the model's verbal response is empty.
 
-### [0.3.2] - 2026-04-21
-
-#### Added
-
-- **WebUI Metrics**: Added real-time "tokens per second" (tok/s) and duration metrics displayed directly below assistant messages.
-- **Thinking Accordion**: Replaced "Thinking..." text with a modern brutalist collapsible accordion. Reasoning now streams live into a hidden drawer to keep the UI clean.
-- **Discord Instant Registration**: Added support for `DISCORD_GUILD_ID` for instant slash command updates (bypasses the 1-hour global propagation delay).
-
-#### Fixed
-
-- **Reasoning Persistence**: Optimized the engine to save agent thoughts in `<think>` tags, ensuring reasoning blocks survive page refreshes.
-- **UI Glitch**: Fixed a regression where word-by-word reasoning streams would split into dozens of separate boxes.
-- **Metrics Accuracy**: Updated metrics to include the reasoning time and tokens in the final `tok/s` calculation.
-
 ## Features
 
-- **Autonomous Task Planner**: Breaks down complex requests into multi-step executable plans (new in 0.4.0).
+- **Autonomous Task Planner**: Breaks down complex requests into multi-step executable plans (new in 0.5.0).
 - **Smart Context Management**: Lazy tool loading, compaction, and rolling history to stay within model context limits.
 - **Multi-Channel**: Native support for WebUI, Discord, and WhatsApp.
 - **Core Tools**: Filesystem access, command execution, web search/fetch, and native vision.
