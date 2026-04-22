@@ -982,6 +982,7 @@ button {
 
 .thinking-block,
 .tool-badge,
+.task-plan,
 .error-block {
   font-family: var(--mono);
   margin-bottom: 8px;
@@ -1000,6 +1001,63 @@ button {
   display: inline-flex;
   gap: 6px;
   align-items: center;
+}
+
+.task-plan {
+  display: block;
+}
+
+.task-plan-header {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.task-plan-summary {
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.task-plan-list {
+  margin: 0;
+  padding-left: 1rem;
+}
+
+.task-plan-list li {
+  margin-bottom: 6px;
+}
+
+.task-status {
+  display: inline-block;
+  min-width: 88px;
+  margin-right: 8px;
+  text-transform: lowercase;
+  color: var(--muted);
+}
+
+.task-status.in_progress {
+  color: var(--cyan);
+}
+
+.task-status.completed {
+  color: var(--green);
+}
+
+.task-status.blocked,
+.task-status.failed {
+  color: var(--danger);
+}
+
+.task-title {
+  color: var(--text);
+}
+
+.task-summary {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
 }
 
 .tool-badge.success {

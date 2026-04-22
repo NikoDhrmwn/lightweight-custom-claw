@@ -68,6 +68,8 @@
     settingThinking: $("#settingThinking"),
     settingWorkspace: $("#settingWorkspace"),
     settingMaxTurns: $("#settingMaxTurns"),
+    settingPlannerMode: $("#settingPlannerMode"),
+    settingPlannerMaxReplans: $("#settingPlannerMaxReplans"),
     settingContextTokens: $("#settingContextTokens"),
     settingContextBudgetPct: $("#settingContextBudgetPct"),
     settingSkillsMaxInjected: $("#settingSkillsMaxInjected"),
@@ -247,6 +249,7 @@
     messagesEl.innerHTML = "";
     updateHeader();
     loadSessionHistory(sessionKey);
+    loadSessionTaskPlan(sessionKey);
     loadSessions();
     fetchSessionMetrics(sessionKey);
     sendSessionInit();
@@ -299,6 +302,37 @@
     }
   }
 
+  async function loadSessionTaskPlan(sessionKey) {
+    try {
+      const data = await fetchJson(`/api/sessions/${encodeURIComponent(sessionKey)}/task-plan`);
+      if (sessionKey !== currentSessionKey) return;
+      const taskPlan = data.taskPlan?.plan;
+      if (!taskPlan || !Array.isArray(taskPlan.tasks) || taskPlan.tasks.length === 0) return;
+      addRestoredTaskPlan(taskPlan);
+    } catch {
+      // Ignore missing task-plan state.
+    }
+  }
+
+  function addRestoredTaskPlan(plan) {
+    hideWelcome();
+    const el = document.createElement("div");
+    el.className = "message assistant restored-plan";
+    el.innerHTML = `
+      <div class="message-avatar">LC</div>
+      <div class="message-body">
+        <div class="message-sender">LiteClaw</div>
+        <div class="message-content"></div>
+      </div>
+    `;
+    messagesEl.appendChild(el);
+
+    const previousAssistant = currentAssistantEl;
+    currentAssistantEl = el;
+    appendPlan(plan);
+    currentAssistantEl = previousAssistant;
+  }
+
   // ─── Health Rendering ─────────────────────────────────────────────
 
   function renderHealth() {
@@ -333,6 +367,8 @@
     refs.settingThinking.value = config.agent?.thinkingDefault || "medium";
     refs.settingWorkspace.value = config.agent?.workspace || "";
     refs.settingMaxTurns.value = config.agent?.maxTurns || 20;
+    refs.settingPlannerMode.value = config.agent?.planner?.mode || "auto";
+    refs.settingPlannerMaxReplans.value = config.agent?.planner?.maxReplans ?? 2;
     refs.settingContextTokens.value = config.agent?.contextTokens || 64000;
     refs.settingContextBudgetPct.value = config.agent?.contextBudgetPct || 80;
     refs.settingSkillsMaxInjected.value = config.agent?.skills?.maxInjected || 2;
@@ -373,6 +409,10 @@
       agent: {
         workspace: refs.settingWorkspace.value.trim(),
         maxTurns: Number(refs.settingMaxTurns.value || 20),
+        planner: {
+          mode: refs.settingPlannerMode.value || "auto",
+          maxReplans: Number(refs.settingPlannerMaxReplans.value || 2),
+        },
         toolLoading,
         thinkingDefault: refs.settingThinking.value,
         contextTokens: Number(refs.settingContextTokens.value || 64000),
@@ -661,6 +701,61 @@
     scrollToBottom();
   }
 
+  function appendPlan(plan) {
+    if (!plan || !Array.isArray(plan.tasks)) return;
+    ensureAssistantMessage();
+
+    let block = currentAssistantEl.querySelector(".task-plan");
+    if (!block) {
+      block = document.createElement("div");
+      block.className = "task-plan";
+      currentAssistantEl.querySelector(".message-body").insertBefore(block, currentAssistantEl.querySelector(".message-content"));
+    }
+
+    const items = plan.tasks.map((task, index) => {
+      const status = escapeHtml(task.status || "pending");
+      const title = escapeHtml(task.title || `Task ${index + 1}`);
+      return `<li data-task-id="${escapeHtml(task.id || `task_${index + 1}`)}"><span class="task-status ${status}">${status}</span><span class="task-title">${title}</span></li>`;
+    }).join("");
+
+    block.innerHTML = `
+      <div class="task-plan-header">Task Plan</div>
+      <div class="task-plan-summary">${escapeHtml(plan.summary || "Working through the request step by step.")}</div>
+      <ol class="task-plan-list">${items}</ol>
+    `;
+    scrollToBottom();
+  }
+
+  function appendTaskUpdate(msg) {
+    ensureAssistantMessage();
+    if (msg.plan) appendPlan(msg.plan);
+
+    const planEl = currentAssistantEl?.querySelector(".task-plan");
+    if (!planEl) return;
+
+    const taskId = msg.taskId || "";
+    const taskStatus = msg.taskStatus || "pending";
+    const taskTitle = msg.taskTitle || "Task";
+    const taskIndex = msg.taskIndex || 0;
+    const taskTotal = msg.taskTotal || 0;
+    const taskSummary = msg.taskSummary || "";
+
+    let item = taskId ? planEl.querySelector(`[data-task-id="${CSS.escape(taskId)}"]`) : null;
+    if (!item) {
+      const list = planEl.querySelector(".task-plan-list");
+      item = document.createElement("li");
+      item.dataset.taskId = taskId;
+      list?.appendChild(item);
+    }
+
+    item.innerHTML = `
+      <span class="task-status ${escapeHtml(taskStatus)}">${escapeHtml(taskStatus)}</span>
+      <span class="task-title">[${escapeHtml(String(taskIndex))}/${escapeHtml(String(taskTotal))}] ${escapeHtml(taskTitle)}</span>
+      ${taskSummary ? `<span class="task-summary">${escapeHtml(taskSummary)}</span>` : ""}
+    `;
+    scrollToBottom();
+  }
+
   function appendError(text) {
     ensureAssistantMessage();
     const err = document.createElement("div");
@@ -721,6 +816,12 @@
         ensureAssistantMessage();
         currentContent += msg.content || "";
         renderAssistantContent();
+        break;
+      case "plan":
+        appendPlan(msg.plan || null);
+        break;
+      case "task_update":
+        appendTaskUpdate(msg);
         break;
       case "tool_start":
         appendToolBadge(msg.tool || "tool");

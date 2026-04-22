@@ -189,6 +189,18 @@
               <input id="settingMaxTurns" type="number" min="1" max="100">
             </label>
             <label class="field">
+              <span>Planner mode</span>
+              <select id="settingPlannerMode">
+                <option value="auto">Auto</option>
+                <option value="always">Always</option>
+                <option value="off">Off</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Max replans</span>
+              <input id="settingPlannerMaxReplans" type="number" min="0" max="10">
+            </label>
+            <label class="field">
               <span>Context tokens</span>
               <input id="settingContextTokens" type="number" min="1024">
             </label>
