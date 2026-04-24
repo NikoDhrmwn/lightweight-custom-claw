@@ -16,16 +16,22 @@ import { ConfirmationManager, buildWebUIConfirmation } from '../core/confirmatio
 import { MemoryStore } from '../core/memory.js';
 import { getConfig, getConfigPath, getStateDir, loadConfig, reloadConfig, saveConfig, type LiteClawConfig } from '../config.js';
 import { createLogger } from '../logger.js';
+import { processFile } from '../core/file_processor.js';
 
 const log = createLogger('gateway');
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ─── Types ───────────────────────────────────────────────────────────
 
+interface WSAttachment {
+  name: string;
+  dataUrl: string;
+}
+
 interface WSMessage {
   type: 'message' | 'confirmation_response' | 'ping' | 'session_init';
   content?: string;
-  images?: string[];
+  attachments?: WSAttachment[];
   confirmationId?: string;
   confirmed?: boolean;
   sessionKey?: string;
@@ -153,6 +159,19 @@ export class GatewayServer {
         memory.clearSession(req.params.sessionKey);
         memory.close();
         res.json({ success: true });
+      } catch (err: any) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // Rollback session (delete last N messages)
+    this.app.post('/api/sessions/:sessionKey/rollback', (req, res) => {
+      try {
+        const count = Number(req.query.count || 1);
+        const memory = new MemoryStore();
+        const changes = memory.deleteLastMessages(req.params.sessionKey, count);
+        memory.close();
+        res.json({ success: true, changes });
       } catch (err: any) {
         res.status(500).json({ error: err.message });
       }
@@ -302,7 +321,7 @@ export class GatewayServer {
 
     return {
       status: 'ok',
-      version: '0.1.0',
+      version: '0.6.3',
       model: primary.split('/').pop() ?? primary,
       primaryModel: primary,
       uptime: process.uptime(),
@@ -357,7 +376,7 @@ export class GatewayServer {
 
     return {
       meta: {
-        version: config.meta?.version ?? '0.1.0',
+        version: config.meta?.version ?? '0.6.3',
       },
       paths: {
         stateDir: getStateDir(),
@@ -366,6 +385,9 @@ export class GatewayServer {
       },
       llm: {
         primary: config.llm?.defaults?.primary ?? '',
+        temperature: config.llm?.defaults?.temperature ?? 1.0,
+        topP: config.llm?.defaults?.topP ?? 1.0,
+        maxOutputTokens: config.llm?.defaults?.maxOutputTokens ?? 8192,
         availableModels,
       },
       agent: {
@@ -509,7 +531,7 @@ export class GatewayServer {
     const sessionKey = msg.sessionKey ?? 'webui:default';
     const content = msg.content?.trim() ?? '';
 
-    if (!content && (!msg.images || msg.images.length === 0)) {
+    if (!content && (!msg.attachments || msg.attachments.length === 0)) {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'error', content: 'Message cannot be empty.' }));
         ws.send(JSON.stringify({ type: 'done' }));
@@ -517,15 +539,46 @@ export class GatewayServer {
       return;
     }
 
+    const images: string[] = [];
+    const fileContents: string[] = [];
+
+    log.info({ 
+      hasContent: !!msg.content, 
+      attachmentsCount: msg.attachments?.length || 0 
+    }, 'Processing WebUI message');
+
+    if (msg.attachments) {
+      for (const attachment of msg.attachments) {
+        try {
+          const processed = await processFile(attachment.name, attachment.dataUrl);
+          log.info({ name: attachment.name, type: processed.type }, 'Processed attachment');
+          if (processed.type.startsWith('image/')) {
+            images.push(attachment.dataUrl);
+          } else {
+            fileContents.push(`--- FILE: ${processed.name} ---\n${processed.content}\n--- END FILE ---`);
+          }
+        } catch (err: any) {
+          log.error({ name: attachment.name, error: err.message }, 'Failed to process attachment');
+          fileContents.push(`--- FILE ERROR: ${attachment.name} ---\n${err.message}\n--- END FILE ---`);
+        }
+      }
+    }
+
+    let finalMessage = content;
+    if (fileContents.length > 0) {
+      finalMessage += '\n\nAttached files content:\n' + fileContents.join('\n\n');
+    }
+
     const request: AgentRequest = {
-      message: content || '(image attached)',
-      images: msg.images,
+      message: finalMessage || '(attachments)',
+      images: images.length > 0 ? images : undefined,
+      attachments: msg.attachments,
       sessionKey,
       channelType: 'webui',
       workingDir: this.resolveWorkspace(msg.workingDir),
     };
 
-    log.info({ sessionKey, messageLength: request.message.length }, 'WebUI message received');
+    log.info({ sessionKey, messageLength: request.message.length, imageCount: images.length }, 'WebUI message received');
 
     try {
       for await (const event of this.engine.processRequest(request)) {
@@ -685,9 +738,14 @@ export class GatewayServer {
 function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): LiteClawConfig {
   const next: LiteClawConfig = structuredClone(config);
 
-  if (patch.llm?.primary !== undefined) {
-    (next.llm ??= {}).defaults ??= {};
-    next.llm.defaults!.primary = String(patch.llm.primary);
+  if (patch.llm) {
+    next.llm ??= {};
+    next.llm.defaults ??= {};
+    if (patch.llm.primary !== undefined) next.llm.defaults.primary = String(patch.llm.primary);
+    if (patch.llm.temperature !== undefined) next.llm.defaults.temperature = Number(patch.llm.temperature);
+    if (patch.llm.topP !== undefined) next.llm.defaults.topP = Number(patch.llm.topP);
+    if (patch.llm.topK !== undefined) next.llm.defaults.topK = Number(patch.llm.topK);
+    if (patch.llm.maxOutputTokens !== undefined) next.llm.defaults.maxOutputTokens = Number(patch.llm.maxOutputTokens);
   }
 
   if (patch.agent) {

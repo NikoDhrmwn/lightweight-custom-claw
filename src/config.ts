@@ -23,6 +23,10 @@ export interface LiteClawConfig {
       primary?: string;
       fallbacks?: string[];
       imageModel?: string;
+      temperature?: number;
+      topP?: number;
+      topK?: number;
+      maxOutputTokens?: number;
     };
   };
   agent?: {
@@ -144,7 +148,7 @@ export function reloadConfig(configPath?: string): LiteClawConfig {
 
 export function getDefaultConfig(): LiteClawConfig {
   return {
-    meta: { version: '0.1.0' },
+    meta: { version: '0.6.3' },
     llm: {
       providers: {
         local: {
@@ -204,7 +208,7 @@ export function getDefaultConfig(): LiteClawConfig {
         ],
       },
       web: {
-        search: { provider: 'google-grounding', browserFallback: true },
+        search: { provider: 'free-metasearch', browserFallback: true },
         fetch: { enabled: true },
       },
       filesystem: { enabled: true, confirmDelete: true },
