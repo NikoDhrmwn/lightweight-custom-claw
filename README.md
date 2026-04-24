@@ -11,44 +11,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-### [0.5.0] - 2026-04-23
+### [0.6.3] - 2026-04-24
 
 #### Added
 
-- **Enhanced Search Engine**: Replaced Google Grounding with a custom, privacy-focused DuckDuckGo search integration utilizing Playwright for robust web results.
-- **Autonomous Multi-Step Planning**: The engine can now autonomously decide to enter "Plan Mode" to solve complex queries that require multiple tool calls.
-- **Real-Time WebUI Metrics**: Added live "Thinking" blocks and generation performance metrics (tok/s) to the WebUI for better transparency.
-- **Discord Reliability**: Implemented a state-tracking system to ensure Discord bot status correctly returns to "Idle" after task completion.
+- **The World of Elyndor**: Integrated a new high-fantasy preconfigured world with deep lore, regional factions, and RAG-assisted narrative generation.
+- **Advanced D&D Combat Engine**: Implemented a stateful combat system with initiative tracking, persistent HP/AC management, and dynamic action menus.
+- **Inventory & Skill Systems**: Added starter kits, weapon requirements, and class-specific skills with persistent usage tracking.
+- **RAG Document Ingestion**: Added support for multi-format document ingestion (PDF, MD, TXT, DOCX) for session-aware knowledge retrieval.
+- **Onboarding Improvements**: Streamlined player join flows and character profile initialization with persistent state.
 
 #### Fixed
 
-- **Status Persistence**: Fixed a regression where the bot would remain stuck in "Thinking" or "Reading" state on Discord.
-- **Engine Stability**: Improved the structural enforcement of the task execution loop to prevent model stalling on local backends.
+- **Git Tracking**: Added `brain/` directory to `.gitignore` to prevent generated session data and research logs from being tracked.
+- **Version Consistency**: Normalized version reporting to `0.6.3` across all modules.
 
-### [0.4.0] - 2026-04-22
+### [0.6.0] - 2026-04-23
 
 #### Added
 
-- **Autonomous Task Planner**: Introduced a state-of-the-art planning system that breaks complex user requests into discrete, executable tasks.
-- **Task-Driven Execution Loop**: A new specialized loop for executing plan items, featuring strict structural enforcement and automatic "repair" nudges for local LLMs.
-- **Smart Research Heuristics**: Enhanced the engine's ability to automatically detect when a request (like price checking or web research) requires a multi-step plan.
-- **Discord Status Emojis**: Added planning progress tracking via Discord reactions (`🗺️`, `→`, `⚙`, `✓`, `X`).
-- **Auto-Build Workflow**: Streamlined the development process—`npm run dev` now automatically builds the project and synchronizes WebUI assets.
+- **Discord DnD Sessions**: Added persistent DnD session threads with SQLite-backed session state, player rosters, turn tracking, and save checkpoints.
+- **Session Recovery Flows**: Added join-existing-session, resume-in-thread, partial-party resume, availability toggles, and session/checkpoint listing commands.
+- **Party Skip Voting**: Added persistent vote-to-skip handling for unavailable players, including restart-safe timeout resolution and automatic turn skipping.
+- **Combat, Stats, and XP Tracking**: Added persistent character sheets, `/stats`, initiative-based combat flow, action menus, checkpoint restore by checkpoint ID, and quest/combat XP progression with level tracking.
+- **DnD Question Modes + RAG**: Added `/question` public/private modes and DnD session RAG context that automatically starts the local embedding server when a session is started or refreshed.
 
 #### Fixed
 
-- **Silent Model Stalling**: Implemented a fallback mechanism to prevent "(No response)" messages when models complete tool calls without providing a final verbal summary.
-- **Malformed JSON Recovery**: Added a robust, regex-backed JSON parser to the task engine to handle unquoted keys and common syntax errors from smaller models like Gemma 4.
-- **Empty Response Fallback**: The Discord channel now automatically displays tool progress if the model's verbal response is empty.
+- **Version Consistency**: Normalized runtime, CLI, gateway, and config version reporting to `0.6.0`.
+- **README Changelog Scope**: Trimmed the visible changelog to the two most recent releases and corrected the release framing for the DnD work.
 
 ## Features
 
-- **Autonomous Task Planner**: Breaks down complex requests into multi-step executable plans (new in 0.5.0).
+- **Autonomous Task Planner**: Breaks down complex requests into multi-step executable plans.
 - **Smart Context Management**: Lazy tool loading, compaction, and rolling history to stay within model context limits.
 - **Multi-Channel**: Native support for WebUI, Discord, and WhatsApp.
+- **Discord DnD Sessions**: New slash-command workflow for multiplayer session threads, persistent player rosters, join/resume flows, partial-party resumes, and vote-based turn skipping.
 - **Core Tools**: Filesystem access, command execution, web search/fetch, and native vision.
 - **Safety First**: Cross-channel confirmations for destructive or sensitive actions.
 - **Skills System**: Project-level skills support with selective prompt injection.
+
+## Discord DnD Commands
+
+LiteClaw now includes a lightweight DnD session subsystem for Discord:
+
+- `/dnd start` creates a dedicated session thread and opens the lobby.
+- `/dnd join` joins the current or specified session with a character profile, including joining midway through an active session.
+- `/dnd begin` starts play and establishes turn order.
+- `/dnd save` pauses the session and stores a checkpoint in SQLite.
+- `/dnd resume` restores a saved session into the current thread, including partial-party mode.
+- `/dnd restore` restores a specific checkpoint by checkpoint ID.
+- `/dnd list` shows resumable sessions in the current guild.
+- `/dnd checkpoints` lists saved checkpoints for a session.
+- `/dnd available` and `/dnd unavailable` toggle whether your turns should be skipped.
+- `/stats` shows your persistent character sheet, level, and XP progress.
+- `/quest complete` and `/quest log` track quest completions and XP rewards.
+- `/combat enter`, `/combat status`, `/combat menu`, and `/combat end` manage initiative and active-turn combat controls.
+- `/vote skip-turn` opens a party vote to skip a player who is unavailable.
+- `/end-turn` advances to the next available player.
+- `/question` asks the GM an out-of-band question tied to the current DnD session without consuming a turn or polluting the main session context.
+- `/question mode:private|public` controls whether the answer stays private or is visible to the table.
+
+### DnD RAG Notes
+
+- LiteClaw stores DnD retrieval data in its state directory and uses a local embedding server for session-aware GM answers.
+- On this machine, the embedding bootstrap script is stored at `E:\Qwen3.6\start-embed-liteclaw.bat`.
+- Starting or refreshing a DnD session automatically ensures the embedding server is running before syncing session context.
 
 ## Quick Start
 
