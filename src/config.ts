@@ -93,6 +93,12 @@ export interface LiteClawConfig {
     filesystem?: Record<string, any>;
     vision?: Record<string, any>;
     mcp?: Record<string, any>;
+    reach?: {
+      groqApiKey?: string;
+      exaApiKey?: string;
+      jinaApiKey?: string;
+      [key: string]: any;
+    };
   };
   mcp?: {
     enabled?: boolean;

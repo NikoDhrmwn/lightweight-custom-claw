@@ -14,7 +14,7 @@ import { parseScheduleTime } from '../core/scheduler.js';
 
 toolRegistry.register({
   name: 'send_interactive_choices',
-  description: 'Send an interactive multi-choice message in the current chat. Uses buttons on Discord or native single-choice polls on WhatsApp.',
+  description: 'Send an interactive multi-choice message with clickable buttons (Discord) or single-choice poll (WhatsApp). Use when you want the user to pick an option before proceeding. IMPORTANT: The prompt and options are rendered directly on screen as interactive buttons. DO NOT repeat, list, or summarize the options in your response text. End your turn immediately and wait for the user to choose.',
   category: 'channel',
   parameters: [
     {
@@ -52,7 +52,7 @@ toolRegistry.register({
       const interactionId = await context.sendInteractiveChoice(request);
       return {
         success: true,
-        output: `Interactive choice posted with id ${interactionId}. Users can now pick: ${request.options.join(', ')}`,
+        output: `Interactive choice buttons posted with id ${interactionId}. The options are already displayed on the user's screen. DO NOT repeat the prompt or list the options in text. Conclude your turn immediately and wait for the user to click an option.`,
       };
     }
 
@@ -65,7 +65,7 @@ toolRegistry.register({
       });
       return {
         success: true,
-        output: `Interactive poll posted on WhatsApp with id ${pollId}. Users can pick: ${request.options.join(', ')}`,
+        output: `Interactive poll posted on WhatsApp with id ${pollId}. The options are already displayed in the poll. DO NOT repeat the prompt or list the options in text. Conclude your turn immediately and wait for the user to vote.`,
       };
     }
 

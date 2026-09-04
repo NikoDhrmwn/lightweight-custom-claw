@@ -1332,23 +1332,32 @@ Do not expose the internal plan outside tags.`;
 
     const prompt = [
       prepared.systemPrompt,
-      '# Final Response',
-      'Write the final user-facing reply after the internal task run.',
-      'Do not mention internal task IDs, internal planning, or hidden reasoning.',
-      'Be concise and direct.',
-      'If a file was sent, say so plainly.',
+      '# Final Response Generation',
+      'You are delivering the final user-facing response after completing a multi-step task plan.',
+      'CRITICAL REQUIREMENTS:',
+      '1. Provide the complete, detailed, and comprehensive answer that directly fulfills the user\'s original request.',
+      '2. Synthesize and incorporate all the research findings, comparisons, technical details, and data gathered across the completed tasks.',
+      '3. NEVER simply confirm that the task is complete or give a one-sentence acknowledgement. Provide the actual answer, analysis, comparison, or solution the user asked for.',
+      '4. Do NOT mention internal task IDs, plan execution internals, or hidden thinking tags.',
+      '5. Structure your response clearly with markdown headings, bullet points, and key takeaways.',
+      '6. If any files or artifacts were created, mention them clearly.',
       failure
-        ? 'The run did not fully complete. Explain what was completed and what blocked the rest.'
-        : 'The run completed successfully. Confirm the outcome clearly.',
+        ? 'The run was partially blocked. Present all results and findings obtained so far, then explain what blocked completion.'
+        : 'The run completed successfully. Deliver the full, comprehensive result answering the user request.',
     ].join('\n');
 
     const userMessage = [
-      `Original user request: ${request.message}`,
+      `User request: ${request.message}`,
+      `Plan goal: ${plan.goal}`,
       `Plan summary: ${plan.summary}`,
-      'Task outcomes:',
+      '',
+      'Completed task outcomes:',
       ...outcomeLines,
-      taskHints.length > 0 ? `Helpful notes:\n${taskHints.map(note => `- ${note}`).join('\n')}` : '',
-      failure ? `Failure point: ${failure.task.title} - ${failure.summary}` : 'Failure point: none',
+      '',
+      taskHints.length > 0 ? `Research findings & task notes:\n${taskHints.map((note, i) => `--- Finding ${i + 1} ---\n${note}`).join('\n\n')}` : '',
+      failure ? `Failure point: ${failure.task.title} - ${failure.summary}` : '',
+      '',
+      'Write the complete, detailed response addressing the user\'s request now:',
     ].filter(Boolean).join('\n');
 
     let content = '';
@@ -1360,7 +1369,7 @@ Do not expose the internal plan outside tags.`;
       temperature: llmDefaults?.temperature,
       topP: llmDefaults?.topP,
       topK: llmDefaults?.topK,
-      maxTokens: llmDefaults?.maxOutputTokens ?? 800
+      maxTokens: Math.max(llmDefaults?.maxOutputTokens ?? 4096, 2500)
     })) {
       if (chunk.type === 'thinking' && chunk.content) {
         yield { type: 'thinking', content: chunk.content };
@@ -1380,7 +1389,12 @@ Do not expose the internal plan outside tags.`;
       return;
     }
 
-    yield { type: 'final_result', content: 'The task is complete.' };
+    if (taskHints.length > 0) {
+      yield { type: 'final_result', content: taskHints.join('\n\n') };
+      return;
+    }
+
+    yield { type: 'final_result', content: plan.summary || 'I have completed the requested tasks.' };
   }
 
   private async *replanRemainingTasks(

@@ -37,6 +37,7 @@ import './tools/session_search.js';
 import './tools/kanban.js';
 import './tools/subagent.js';
 import './tools/skills.js';
+import './tools/reach.js';
 import { SchedulerService } from './core/scheduler.js';
 import { getMemoryStore } from './core/memory.js';
 

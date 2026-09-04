@@ -542,26 +542,59 @@ toolRegistry.register({
   parameters: [
     { name: 'url', type: 'string', description: 'The URL to fetch', required: true },
     { name: 'maxChars', type: 'number', description: 'Maximum characters to return (default: 5000)' },
+    { name: 'mode', type: 'string', description: 'Fetch mode: "markdown" (uses Jina Reader, default) or "raw" (direct fetch)' },
   ],
   usageNotes: [
     'Use this when you already have a specific URL and need the page contents.',
-    'Do not use this for general search tasks; use web_search first.',
+    'By default extracts clean markdown via Jina Reader, with automatic fallback to direct fetch.',
     'Keep maxChars modest when you only need a quick inspection.'
   ],
   examples: [
     { userIntent: 'fetch this article', arguments: { url: 'https://example.com', maxChars: 4000 } },
   ],
-  keywords: ['fetch', 'url', 'website', 'page', 'http', 'download', 'get', 'load', 'scrape'],
+  keywords: ['fetch', 'url', 'website', 'page', 'http', 'download', 'get', 'load', 'scrape', 'jina'],
   handler: async (args): Promise<ToolResult> => {
     const url = args.url;
     if (!url) {
       return { success: false, output: 'No URL specified' };
     }
 
+    const maxChars = args.maxChars ?? 5000;
+    const mode = args.mode ?? 'markdown';
+
+    // 1. Try Jina Reader first for clean markdown (unless raw mode requested)
+    if (mode !== 'raw' && !url.includes('127.0.0.1') && !url.includes('localhost')) {
+      try {
+        const jinaResp = await fetch(`https://r.jina.ai/${url}`, {
+          headers: {
+            'Accept': 'text/markdown',
+            'X-Retain-Images': 'none',
+          },
+          signal: AbortSignal.timeout(12_000),
+        });
+
+        if (jinaResp.ok) {
+          let jinaText = await jinaResp.text();
+          if (jinaText && jinaText.length > 80 && !jinaText.includes('Target URL returned error 412')) {
+            if (jinaText.length > maxChars) {
+              jinaText = jinaText.slice(0, maxChars) + `\n\n... [truncated, ${jinaText.length} total chars]`;
+            }
+            return {
+              success: true,
+              output: `URL: ${url} (via Jina Reader)\n\n${jinaText}`,
+            };
+          }
+        }
+      } catch {
+        // Fall through to direct fetch
+      }
+    }
+
+    // 2. Direct fetch fallback
     try {
       const response = await fetch(url, {
         headers: {
-          'User-Agent': 'LiteClaw/0.1 (Local AI Agent)',
+          'User-Agent': 'LiteClaw/1.0 (Local AI Agent)',
           'Accept': 'text/html,text/plain,application/json',
         },
         signal: AbortSignal.timeout(15_000),

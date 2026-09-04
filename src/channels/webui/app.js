@@ -1294,6 +1294,7 @@
   function renderMarkdown(text) {
     const codeBlocks = [];
     const thinkBlocks = [];
+    const tableBlocks = [];
     let working = normalizeMarkdownForDisplay(dedupeRepeatedParagraphs(String(text || "")));
 
     // Isolate thinking blocks so they don't get wrapped inside <p> tags.
@@ -1317,6 +1318,13 @@
       return token;
     });
 
+    // Isolate markdown table blocks before paragraph splitting
+    working = working.replace(/((?:^[ \t]*\|[^\n]+\|[ \t]*\n)[ \t]*\|(?:\s*:?-+:?\s*\|)+\n(?:[ \t]*\|[^\n]+\|[ \t]*(?:\n|$))+)/gm, (match) => {
+      const token = `@@TABLE${tableBlocks.length}@@`;
+      tableBlocks.push(renderMarkdownTable(match.trim()));
+      return `\n\n${token}\n\n`;
+    });
+
     let html = escapeHtml(working)
       .replace(/^### (.+)$/gm, "<h4>$1</h4>")
       .replace(/^## (.+)$/gm, "<h3>$1</h3>")
@@ -1330,7 +1338,7 @@
       // Don't trim the end during streaming to avoid stripping the space the model just typed
       const trimmed = isStreaming ? chunk.trimStart() : chunk.trim();
       if (!trimmed) return "";
-      if (/^@@CODE\d+@@$/.test(trimmed) || /^@@THINK\d+@@$/.test(trimmed) || /^<h[234]>/.test(trimmed)) return trimmed;
+      if (/^@@CODE\d+@@$/.test(trimmed) || /^@@THINK\d+@@$/.test(trimmed) || /^@@TABLE\d+@@$/.test(trimmed) || /^<h[234]>/.test(trimmed)) return trimmed;
       if (looksLikeMarkdownTable(trimmed)) {
         return renderMarkdownTable(trimmed);
       }
@@ -1372,6 +1380,9 @@
     thinkBlocks.forEach((block, i) => {
       html = html.replace(`@@THINK${i}@@`, block);
     });
+    tableBlocks.forEach((block, i) => {
+      html = html.replace(`@@TABLE${i}@@`, block);
+    });
 
     return html;
   }
@@ -1388,7 +1399,6 @@
       .replace(/(\|\|)(?=[A-Za-z#])/g, "||\n")
       .replace(/([a-z0-9])(?=#{1,6}[A-Z])/g, "$1\n\n")
       .replace(/([.!?])\s+(?=[A-Z][a-z].{0,40}:)/g, "$1\n")
-      .replace(/\|\|/g, "|\n|")
       .replace(/([a-z0-9)])(\*\*[A-Z])/g, "$1\n\n$2")
       .replace(/([a-z0-9)])(#{1,6}\s)/g, "$1\n\n$2")
       .replace(/([a-z])([A-Z][a-z]+:)/g, "$1\n$2");
@@ -1477,9 +1487,17 @@
     return /^\|?[\s:-]+\|[\s|:-]*$/.test(lines[1]);
   }
 
+  function formatTableCell(cell) {
+    return escapeHtml(cell)
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^\*])\*(.+?)\*/g, "$1<em>$2</em>")
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  }
+
   function renderMarkdownTable(text) {
     const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
-    if (lines.length < 2) return `<p>${text}</p>`;
+    if (lines.length < 2) return `<p>${escapeHtml(text)}</p>`;
 
     const parseRow = (line) => line
       .replace(/^\|/, "")
@@ -1490,9 +1508,9 @@
     const headers = parseRow(lines[0]);
     const rows = lines.slice(2).map(parseRow);
 
-    const headHtml = headers.map((cell) => `<th>${cell}</th>`).join("");
+    const headHtml = headers.map((cell) => `<th>${formatTableCell(cell)}</th>`).join("");
     const bodyHtml = rows.map((row) => {
-      const cells = headers.map((_, index) => `<td>${row[index] ?? ""}</td>`).join("");
+      const cells = headers.map((_, index) => `<td>${formatTableCell(row[index] ?? "")}</td>`).join("");
       return `<tr>${cells}</tr>`;
     }).join("");
 

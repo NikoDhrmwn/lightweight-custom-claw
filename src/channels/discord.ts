@@ -863,11 +863,20 @@ export class DiscordChannel {
           replyStyle: this.config.replyStyle ?? 'single',
           showToolProgress: this.config.showToolProgress ?? false,
           maxLen: 1900,
-          format: 'plain',
+          format: 'discord',
         });
-        await flushProgress(true, messages[0] ?? '(No response)');
-        for (let i = 1; i < messages.length; i++) {
-          await interaction.followUp(messages[i]);
+
+        const hasPlan = progress.tasks.length > 0;
+        if (hasPlan) {
+          await flushProgress(true);
+          for (const msg of messages) {
+            await interaction.followUp({ content: msg });
+          }
+        } else {
+          await flushProgress(true, messages[0] ?? '(No response)');
+          for (let i = 1; i < messages.length; i++) {
+            await interaction.followUp(messages[i]);
+          }
         }
       }
     } catch (err: any) {
@@ -1508,6 +1517,7 @@ export class DiscordChannel {
     let fullContent = '';
     const toolUpdates: string[] = [];
     let hasThought = false;
+    let interactiveChoiceSent = false;
     const addedReactions = new Set<string>();
     const progress = createDiscordProgressState();
     let progressMessage: Message | null = null;
@@ -1579,6 +1589,7 @@ export class DiscordChannel {
           }
         },
         sendInteractiveChoice: async (choiceRequest) => {
+          interactiveChoiceSent = true;
           return this.sendInteractiveChoice({
             channelId: channel.id,
             replyTo: async (payload) => replyTo ? replyTo.reply(payload) : (channel as any).send(payload),
@@ -1766,31 +1777,62 @@ export class DiscordChannel {
           replyStyle: this.config.replyStyle ?? 'single',
           showToolProgress: this.config.showToolProgress ?? false,
           maxLen: 1900,
-          format: 'plain',
+          format: 'discord',
         });
 
-        const first = messages[0] ?? '(No response)';
-        const resolvedFirst = resolveDiscordMentions(first, mentionTargets);
+        const hasPlan = progress.tasks.length > 0;
 
-        if (progressMessage) {
-          await progressMessage.edit({
-            content: resolvedFirst.content,
-            embeds: progress.tasks.length > 0 ? [buildDiscordProgressEmbed(progress, resolvedFirst.content)] : [],
-            allowedMentions: {
-              users: resolvedFirst.userIds,
-              repliedUser: false,
-            },
-          });
-        }
+        if (hasPlan) {
+          // Finalize monitoring card without body content so it stays as a clean progress embed
+          if (progressMessage) {
+            await progressMessage.edit({
+              content: null,
+              embeds: [buildDiscordProgressEmbed(progress)],
+              allowedMentions: { repliedUser: false },
+            });
+          }
 
-        for (let i = 1; i < messages.length; i++) {
-          const resolved = resolveDiscordMentions(messages[i], mentionTargets);
-          await (channel as any).send({
-            content: resolved.content,
-            allowedMentions: {
-              users: resolved.userIds,
-            },
-          });
+          // Send the full response as brand new message(s) after the monitoring card
+          for (const msg of messages) {
+            const resolved = resolveDiscordMentions(msg, mentionTargets);
+            await (channel as any).send({
+              content: resolved.content,
+              allowedMentions: {
+                users: resolved.userIds,
+              },
+            });
+          }
+        } else if (interactiveChoiceSent && isRedundantChoiceEcho(structuredNarrative.content)) {
+          // Interactive choices were posted directly with buttons; delete the starting progress placeholder
+          // to prevent duplicate listing of options
+          if (progressMessage) {
+            await progressMessage.delete().catch(() => null);
+            progressMessage = null;
+          }
+        } else {
+          const first = messages[0] ?? '(No response)';
+          const resolvedFirst = resolveDiscordMentions(first, mentionTargets);
+
+          if (progressMessage) {
+            await progressMessage.edit({
+              content: resolvedFirst.content,
+              embeds: [],
+              allowedMentions: {
+                users: resolvedFirst.userIds,
+                repliedUser: false,
+              },
+            });
+          }
+
+          for (let i = 1; i < messages.length; i++) {
+            const resolved = resolveDiscordMentions(messages[i], mentionTargets);
+            await (channel as any).send({
+              content: resolved.content,
+              allowedMentions: {
+                users: resolved.userIds,
+              },
+            });
+          }
         }
       }
 
@@ -1923,7 +1965,7 @@ export class DiscordChannel {
       replyStyle: this.config.replyStyle ?? 'single',
       showToolProgress: this.config.showToolProgress ?? false,
       maxLen: 1900,
-      format: 'plain',
+      format: 'discord',
     });
 
     for (let i = 0; i < messages.length; i++) {
@@ -2229,6 +2271,25 @@ export class DiscordChannel {
       return;
     }
 
+    // Disable clicked buttons on original message so user cannot double-click
+    try {
+      if (interaction.message?.components) {
+        const disabledRows = interaction.message.components.map(row => {
+          const newRow = new ActionRowBuilder<ButtonBuilder>();
+          for (const comp of (row as any).components) {
+            const btn = ButtonBuilder.from(comp);
+            btn.setDisabled(true);
+            if (comp.customId === interaction.customId) {
+              btn.setStyle(ButtonStyle.Primary);
+            }
+            newRow.addComponents(btn);
+          }
+          return newRow;
+        });
+        await interaction.message.edit({ components: disabledRows });
+      }
+    } catch { /* ignore if interaction message cannot be edited */ }
+
     const response = record.responses?.[option]?.trim()
       || `${interaction.user} picked **${option}**.`;
     const content = response.includes(`<@${interaction.user.id}>`) || response.includes(interaction.user.username)
@@ -2238,6 +2299,49 @@ export class DiscordChannel {
     await interaction.reply({
       content,
       allowedMentions: { users: [interaction.user.id] },
+    });
+
+    // Invoke agent turn with the user's selected choice
+    const channel = interaction.channel;
+    if (!channel || !channel.isTextBased()) return;
+
+    const mentionTargets: MentionTarget[] = [
+      createDiscordMentionTarget(
+        interaction.user.id,
+        (interaction.member as any)?.displayName || interaction.user.globalName || interaction.user.username,
+        interaction.user.username,
+        interaction.user.tag
+      ),
+    ];
+
+    const effectivePrompt = `I chose "${option}" in response to: "${record.prompt}". Please proceed with this selection.`;
+    const effectiveMessage = buildStructuredIncomingMessage(
+      {
+        platform: 'discord',
+        conversationLabel: interaction.guild
+          ? `Guild #${'name' in channel ? (channel as any).name : channel.id}`
+          : 'Discord DM',
+        sender: {
+          id: interaction.user.id,
+          label: interaction.user.tag,
+          name: (interaction.member as any)?.displayName || interaction.user.globalName || interaction.user.username,
+          username: interaction.user.username,
+          tag: interaction.user.tag,
+        },
+        isGroupChat: Boolean(interaction.guildId),
+        wasMentioned: true,
+        mentionTargets,
+      },
+      effectivePrompt
+    );
+
+    await this.processAgentTurn({
+      channel: channel as any,
+      author: interaction.user,
+      replyTo: null,
+      effectiveMessage,
+      mentionTargets,
+      shouldTreatAsDndTableTalk: false,
     });
   }
 
@@ -2620,3 +2724,21 @@ function convertTablesToBullets(text: string): string {
 
   return result.join('\n');
 }
+
+function isRedundantChoiceEcho(text: string): boolean {
+  if (!text) return true;
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return true;
+
+  const lines = trimmed.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lines.length === 0) return true;
+
+  const choiceEchoLines = lines.filter(l =>
+    /^\d+[\.\)]\s+/.test(l) ||
+    /^[-*•]\s+/.test(l) ||
+    /^(once you (choose|pick|select)|please (choose|pick|select)|which (one|dimension|option)|make a choice|pick an option)/i.test(l)
+  );
+
+  return choiceEchoLines.length >= Math.ceil(lines.length * 0.7);
+}
+

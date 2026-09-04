@@ -13,9 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### [1.0.1] - 2026-09-04
 
+#### Added
+
+- **Agent-Reach Integration**: Complete integration of Agent-Reach capabilities across 15 platforms (YouTube, Bilibili, Reddit, GitHub, XiaoHongShu, LinkedIn, V2EX, Xueqiu, Twitter/X, and web):
+  - 5 core tools: `reach_doctor`, `web_extract` (Jina Reader), `reach_read` (YouTube transcripts, V2EX, Reddit, GitHub), `reach_search` (YouTube via flat-playlist yt-dlp, GitHub, dev communities), and `reach_transcribe` (Whisper STT).
+  - Built-in `agent-reach` skill with platform routing and 7 reference playbooks (`search.md`, `social.md`, `career.md`, `dev.md`, `web.md`, `video.md`, `finance.md`).
+  - CLI diagnostic command: `liteclaw reach doctor [--detailed]`.
+  - Configurable API keys in `tools.reach` (`jinaApiKey`, `groqApiKey`, `exaApiKey`).
+
 #### Fixed
 
 - **Plan-mode web search** — tools selected at request-time (e.g. `web_search`) were silently dropped during per-task tool resolution because vague planner-generated task titles didn't re-trigger keyword scoring. `resolveTaskTools()` now merges the request-level selection with per-task scoring and force-includes any tool explicitly listed in `task.suggestedTools`.
+- **Plan-mode final answer delivery** — `generateFinalResponse()` now synthesizes all findings, research data, and task notes into a comprehensive, detailed answer rather than outputting a generic confirmation ("The task is complete").
+- **Plan-mode response separation on Discord** — The progress monitoring embed remains a dedicated status card, and the agent's final substantive answer is sent as brand new message(s) directly to the channel or via followUp.
+- **Interactive choice button inactivity** — Clicking a choice button on Discord now disables the buttons to prevent duplicate clicks, announces the selection, and invokes an agent turn with the selected choice to continue execution seamlessly.
+- **Duplicate choice text suppression** — Eliminated redundant text echoes where the agent repeated the choices after interactive buttons were already rendered.
+- **Cross-channel table & markdown formatting**:
+  - **Discord**: Automatically converts markdown tables into clean monospace code blocks with aligned box-drawing characters for compact tables, or structured cards for wide tables.
+  - **WhatsApp**: Converts markdown tables into mobile-friendly bullet cards with bold headers and clear key-value lines.
+  - **WebUI**: Fixed table parsing to isolate tables before paragraph splitting, restored empty cell handling, enabled inline formatting (bold, italic, code, links) within cells, and added modern styled CSS for `.table-wrap`.
 
 ### [1.0.0] - 2026-09-04
 

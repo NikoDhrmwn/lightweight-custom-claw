@@ -1,5 +1,5 @@
 import type { AgentStreamEvent } from '../core/engine.js';
-import { formatForWhatsApp, sanitizeChannelContent, splitMessage } from './utils.js';
+import { formatForWhatsApp, formatTablesForDiscord, sanitizeChannelContent, splitMessage } from './utils.js';
 
 export type ChannelProgressStatus = 'starting' | 'thinking' | 'planning' | 'working' | 'done' | 'error';
 export type ChannelTaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'blocked' | 'skipped';
@@ -26,7 +26,7 @@ export interface OutgoingMessageOptions {
   replyStyle: 'single' | 'rapid';
   showToolProgress: boolean;
   maxLen: number;
-  format?: 'plain' | 'whatsapp';
+  format?: 'plain' | 'whatsapp' | 'discord';
 }
 
 export function createChannelProgressState(): ChannelProgressState {
@@ -168,10 +168,14 @@ export function formatProgressPreview(finalContent: string | undefined, flavor: 
   const preview = formatted.slice(0, maxLen);
   return preview ? `${preview}${formatted.length > maxLen ? '...' : ''}` : '';
 }
-
 export function buildOutgoingMessages(content: string, toolUpdates: string[], options: OutgoingMessageOptions): string[] {
   const sanitized = sanitizeChannelContent(content).trim();
-  const cleanedContent = options.format === 'whatsapp' ? formatForWhatsApp(sanitized) : sanitized;
+  let cleanedContent = sanitized;
+  if (options.format === 'whatsapp') {
+    cleanedContent = formatForWhatsApp(sanitized);
+  } else if (options.format === 'discord') {
+    cleanedContent = formatTablesForDiscord(sanitized);
+  }
   const toolSummary = (options.showToolProgress || !cleanedContent) && toolUpdates.length > 0
     ? toolUpdates.join('\n').trim()
     : '';

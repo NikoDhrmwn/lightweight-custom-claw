@@ -58,13 +58,142 @@ export function splitMessage(text: string, maxLen: number): string[] {
   return chunks;
 }
 
+export interface ParsedMarkdownTable {
+  raw: string;
+  headers: string[];
+  rows: string[][];
+}
+
+/**
+ * Extracts standard markdown pipe tables from text.
+ */
+export function parseMarkdownTables(text: string): ParsedMarkdownTable[] {
+  const tables: ParsedMarkdownTable[] = [];
+  const tableRegex = /((?:^[ \t]*\|[^\n]+\|[ \t]*\r?\n)[ \t]*\|(?:\s*:?-+:?\s*\|)+\r?\n(?:[ \t]*\|[^\n]+\|[ \t]*(?:\r?\n|$))+)/gm;
+  let match: RegExpExecArray | null;
+
+  while ((match = tableRegex.exec(text)) !== null) {
+    const raw = match[1].trimEnd();
+    const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) continue;
+
+    const parseRow = (line: string) => line
+      .replace(/^\|/, '')
+      .replace(/\|$/, '')
+      .split('|')
+      .map(c => c.trim());
+
+    const headers = parseRow(lines[0]);
+    const separatorLine = lines[1];
+    if (!/^\|(?:\s*:?-+:?\s*\|)+$/.test(separatorLine)) continue;
+
+    const rows = lines.slice(2).map(parseRow);
+    tables.push({ raw, headers, rows });
+  }
+
+  return tables;
+}
+
+/**
+ * Converts markdown pipe tables into Discord-friendly representations:
+ * - Compact tables (<= 3 cols, max cell <= 32 chars) become monospace code blocks with box lines.
+ * - Larger or wider tables become clean structured key-value cards with bold labels.
+ */
+export function formatTablesForDiscord(text: string): string {
+  if (!text || !text.includes('|')) return text;
+
+  const tables = parseMarkdownTables(text);
+  if (tables.length === 0) return text;
+
+  let result = text;
+  for (const table of tables) {
+    const { raw, headers, rows } = table;
+    const colCount = headers.length;
+    if (colCount === 0 || rows.length === 0) continue;
+
+    const maxCellLen = Math.max(
+      ...headers.map(h => h.length),
+      ...rows.flatMap(r => r.map(c => c.length))
+    );
+
+    if (colCount <= 3 && maxCellLen <= 32) {
+      const colWidths = headers.map((h, i) => {
+        const cellLens = rows.map(r => (r[i] ?? '').length);
+        return Math.max(h.length, ...cellLens);
+      });
+
+      const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - s.length));
+
+      const headerLine = headers.map((h, i) => pad(h, colWidths[i])).join(' │ ');
+      const sepLine = colWidths.map(w => '─'.repeat(w)).join('─┼─');
+      const rowLines = rows.map(row => {
+        return headers.map((_, i) => pad(row[i] ?? '', colWidths[i])).join(' │ ');
+      });
+
+      const formatted = '```text\n' + [headerLine, sepLine, ...rowLines].join('\n') + '\n```';
+      result = result.replace(raw, formatted);
+    } else {
+      const cards: string[] = [];
+      for (const row of rows) {
+        const primaryKey = row[0] || 'Item';
+        const otherCols = headers.slice(1).map((h, idx) => {
+          const val = row[idx + 1] ?? '—';
+          return `• **${h}**: ${val}`;
+        }).join('\n');
+        cards.push(`**${headers[0]}: ${primaryKey}**\n${otherCols}`);
+      }
+      result = result.replace(raw, cards.join('\n\n'));
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Converts markdown pipe tables into mobile-friendly bullet cards for WhatsApp.
+ */
+export function formatTablesForWhatsApp(text: string): string {
+  if (!text || !text.includes('|')) return text;
+
+  const tables = parseMarkdownTables(text);
+  if (tables.length === 0) return text;
+
+  let result = text;
+  for (const table of tables) {
+    const { raw, headers, rows } = table;
+    if (headers.length === 0 || rows.length === 0) continue;
+
+    const cards: string[] = [];
+    for (const row of rows) {
+      const primaryKey = row[0] || '';
+      const otherCols = headers.slice(1).map((h, idx) => {
+        const val = row[idx + 1] ?? '—';
+        return `  - *${h}*: ${val}`;
+      }).join('\n');
+
+      if (otherCols) {
+        cards.push(`• *${primaryKey}*:\n${otherCols}`);
+      } else {
+        cards.push(`• *${primaryKey}*`);
+      }
+    }
+
+    const title = headers[0] ? `📊 *${headers.join(' | ')}*\n` : '';
+    result = result.replace(raw, `${title}${cards.join('\n\n')}`);
+  }
+
+  return result;
+}
+
 /**
  * Formats standard Markdown for WhatsApp's limited formatting.
  */
 export function formatForWhatsApp(text: string): string {
   if (!text) return '';
 
-  return text
+  let formatted = formatTablesForWhatsApp(text);
+
+  return formatted
     // 1. Convert headers (# Header) to *HEADER*
     .replace(/^#+\s+(.*)$/gm, '*$1*')
 

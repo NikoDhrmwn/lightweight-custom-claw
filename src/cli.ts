@@ -969,4 +969,30 @@ function openEditor(filePath: string): void {
   }
 }
 
+// ─── Reach Command ───────────────────────────────────────────────────
+
+const reachCommand = program
+  .command('reach')
+  .description('Agent Reach — multi-platform internet diagnostics and tools');
+
+reachCommand
+  .command('doctor')
+  .description('Check availability and active backends across 15 internet platforms')
+  .option('-d, --detailed', 'Include detailed probe results')
+  .action(async (options) => {
+    await import('./tools/reach.js');
+    const { toolRegistry } = await import('./core/tools.js');
+    const doctorTool = toolRegistry.get('reach_doctor');
+    if (!doctorTool) {
+      console.log(chalk.red('reach_doctor tool not registered'));
+      return;
+    }
+    const dummyContext: any = {
+      channelType: 'cli',
+      workingDir: process.cwd(),
+    };
+    const result = await doctorTool.handler({ detailed: options.detailed }, dummyContext);
+    console.log(result.output);
+  });
+
 program.parse();
