@@ -29,9 +29,18 @@ import './tools/exec.js';
 import './tools/web.js';
 import './tools/vision.js';
 import './tools/channel.js';
+import './tools/session.js';
+import './tools/scheduler.js';
 import './tools/mcp.js';
+import './tools/memory.js';
+import './tools/session_search.js';
+import './tools/kanban.js';
+import './tools/subagent.js';
+import './tools/skills.js';
+import { SchedulerService } from './core/scheduler.js';
+import { getMemoryStore } from './core/memory.js';
 
-const VERSION = '0.8.3';
+const VERSION = '1.0.1';
 const log = createLogger('main');
 
 export async function startGateway(portOverride?: number): Promise<void> {
@@ -52,7 +61,7 @@ export async function startGateway(portOverride?: number): Promise<void> {
   await llm.refreshProvidersAsync();
   printStepDone(`LLM client initialized (model: ${llm.getModelId()})`);
 
-  const memory = new MemoryStore();
+  const memory = getMemoryStore();
   printStepDone('Memory store loaded');
 
   const confirmations = new ConfirmationManager();
@@ -60,6 +69,11 @@ export async function startGateway(portOverride?: number): Promise<void> {
 
   const engine = new AgentEngine(llm, memory, confirmations);
   printStepDone('Agent engine started');
+
+  const scheduler = new SchedulerService(memory);
+  scheduler.setEngine(engine);
+  scheduler.start();
+  printStepDone('Autonomous scheduler ready');
 
   printSectionEnd();
 
@@ -121,6 +135,7 @@ export async function startGateway(portOverride?: number): Promise<void> {
   // Handle shutdown
   const shutdown = () => {
     console.log('\n  Shutting down LiteClaw...');
+    scheduler.stop();
     gateway.stop();
     memory.close();
     mcpManager.closeAll().catch(() => undefined);

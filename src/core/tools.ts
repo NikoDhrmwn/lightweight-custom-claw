@@ -33,7 +33,7 @@ export interface InteractiveChoiceRequest {
 export interface ToolDefinition {
   name: string;
   description: string;
-  category: 'filesystem' | 'exec' | 'web' | 'vision' | 'channel' | 'utility' | 'mcp';
+  category: 'filesystem' | 'exec' | 'web' | 'vision' | 'channel' | 'utility' | 'session' | 'scheduler' | 'mcp';
   parameters: ToolParameter[];
   /** Optional raw JSON schema for tools that don't fit LiteClaw's flat parameter shape */
   inputSchema?: Record<string, any>;
@@ -54,9 +54,13 @@ export interface ToolDefinition {
 
 export interface ToolContext {
   /** The channel this request came from */
-  channelType: 'webui' | 'discord' | 'whatsapp' | 'cli';
+  channelType: 'webui' | 'discord' | 'whatsapp' | 'cli' | 'subagent';
   /** Channel-specific target (e.g., channel ID, phone number) */
   channelTarget?: string;
+  /** Active session key (e.g., 'whatsapp:1234@s.whatsapp.net') */
+  sessionKey?: string;
+  /** Raw message key or reference from the originating channel */
+  messageKey?: any;
   /** Working directory for exec/file operations */
   workingDir: string;
   /** Function to request confirmation from the user */
@@ -65,6 +69,19 @@ export interface ToolContext {
   sendFile?: (filePath: string, fileName?: string) => Promise<void>;
   /** Function to send an interactive choice prompt to the originating channel */
   sendInteractiveChoice?: (request: InteractiveChoiceRequest) => Promise<string>;
+  /** Function to send a native poll (WhatsApp / Discord) */
+  sendPoll?: (poll: { name: string; options: string[]; selectableCount?: number }) => Promise<string>;
+  /** Function to send a native event (WhatsApp) */
+  sendEvent?: (event: {
+    name: string;
+    description?: string;
+    startDate: Date;
+    endDate?: Date;
+    location?: string;
+    call?: 'audio' | 'video';
+  }) => Promise<string>;
+  /** Function to react with an emoji to the triggering message */
+  react?: (emoji: string) => Promise<void>;
 }
 
 export interface ToolResult {
@@ -84,8 +101,10 @@ const CATEGORY_CONFIG_KEY: Record<string, string> = {
   exec: 'exec',
   web: 'web',
   vision: 'vision',
-  channel: 'filesystem', // channel tools (send_file) follow filesystem enablement
+  channel: 'filesystem', // channel tools follow filesystem enablement
   utility: 'exec',       // utility tools follow exec enablement
+  session: 'filesystem', // session tools follow filesystem enablement
+  scheduler: 'exec',     // scheduler tools follow exec enablement
   mcp: 'mcp',
 };
 

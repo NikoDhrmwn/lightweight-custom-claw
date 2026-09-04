@@ -116,6 +116,27 @@ export interface LiteClawConfig {
     bind?: string;
     auth?: { mode?: string; token?: string };
   };
+  voice?: {
+    enabled?: boolean;
+    asr?: {
+      serverUrl?: string;
+      chunkSizeMs?: number;
+      language?: string;
+    };
+    tts?: {
+      serverUrl?: string;
+      voiceRef?: string;
+      modelName?: string;
+      sampleRate?: number;
+    };
+    vad?: {
+      silenceDurationMs?: number;
+      energyThreshold?: number;
+    };
+    triggerMode?: 'always' | 'wake-word';
+    wakeName?: string;
+    maxResponseTokens?: number;
+  };
 }
 
 // ─── Config Singleton ────────────────────────────────────────────────
@@ -184,7 +205,7 @@ export function reloadConfig(configPath?: string): LiteClawConfig {
 
 export function getDefaultConfig(): LiteClawConfig {
   return {
-    meta: { version: '0.8.4' },
+    meta: { version: '1.0.1' },
     llm: {
       providers: {
         local: {
@@ -273,6 +294,27 @@ export function getDefaultConfig(): LiteClawConfig {
       bind: 'loopback',
       auth: { mode: 'token' },
     },
+    voice: {
+      enabled: false,
+      asr: {
+        serverUrl: 'http://localhost:8089/transcribe',
+        chunkSizeMs: 160,
+        language: 'en',
+      },
+      tts: {
+        serverUrl: 'http://localhost:8090/v1/audio/speech',
+        voiceRef: 'auto',
+        modelName: 'omnivoice',
+        sampleRate: 24000,
+      },
+      vad: {
+        silenceDurationMs: 300,
+        energyThreshold: 0.01,
+      },
+      triggerMode: 'always',
+      wakeName: '',
+      maxResponseTokens: 150,
+    },
   };
 }
 
@@ -327,6 +369,7 @@ export function loadSystemPrompt(): string {
     'SOUL.md',
     'IDENTITY.md',
     'USER.md',
+    'MEMORY.md',
     'AGENTS.md',
     'TOOLS.md',
     'GIFS.md',

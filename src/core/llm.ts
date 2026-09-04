@@ -104,7 +104,7 @@ export function buildProviders(): LLMProvider[] {
  * Query a local OpenAI-compatible server's /v1/models endpoint
  * and return a dynamically detected LLMProvider.
  */
-async function autoDetectLocalModel(provId: string, baseUrl: string, apiKey: string): Promise<LLMProvider | null> {
+async function autoDetectLocalModel(provId: string, baseUrl: string, apiKey: string, rawProvider?: any): Promise<LLMProvider | null> {
   try {
     const url = `${baseUrl.replace(/\/v1\/?$/, '')}/v1/models`;
     const controller = new AbortController();
@@ -131,6 +131,12 @@ async function autoDetectLocalModel(provId: string, baseUrl: string, apiKey: str
 
     log.info({ provider: provId, model: modelInfo.id, contextWindow, vision: hasVision }, 'Auto-detected model from server');
 
+    // Make it fully configurable via provider configuration properties (e.g. tools, reasoning, vision, topK)
+    const supportsTools = rawProvider?.tools ?? rawProvider?.supportsTools ?? true;
+    const supportsReasoning = rawProvider?.reasoning ?? rawProvider?.supportsReasoning ?? true;
+    const supportsVision = rawProvider?.vision ?? rawProvider?.supportsVision ?? hasVision;
+    const supportsTopK = rawProvider?.topK ?? rawProvider?.supportsTopK ?? isLocalishBaseUrl(baseUrl);
+
     return {
       id: `${provId}/${modelInfo.id}`,
       providerId: provId,
@@ -139,11 +145,11 @@ async function autoDetectLocalModel(provId: string, baseUrl: string, apiKey: str
       model: modelInfo.id,
       contextWindow,
       maxTokens: Math.min(contextWindow, 8192),
-      supportsVision: hasVision,
-      supportsTools: true,
-      supportsReasoning: true,
-      supportsTopK: isLocalishBaseUrl(baseUrl),
-      rawProvider: {},
+      supportsVision,
+      supportsTools,
+      supportsReasoning,
+      supportsTopK,
+      rawProvider: rawProvider ?? {},
       rawModel: modelInfo,
     };
   } catch (err: any) {
@@ -173,7 +179,7 @@ export async function buildProvidersAsync(): Promise<LLMProvider[]> {
       models.some((m: any) => m === 'auto' || m?.id === 'auto');
 
     if (wantsAuto && baseUrl) {
-      const detected = await autoDetectLocalModel(provId, baseUrl, apiKey);
+      const detected = await autoDetectLocalModel(provId, baseUrl, apiKey, p);
       if (detected) {
         providers.push(detected);
         continue; // Skip static models for this provider
@@ -335,7 +341,7 @@ export class LLMClient extends EventEmitter {
     return new OpenAI({
       baseURL: baseUrl,
       apiKey: apiKey,
-      timeout: 120_000, // 2 min timeout for slow local models
+      timeout: 180_000, // 3 min timeout for slow local models / long prefill
     });
   }
 
@@ -347,7 +353,7 @@ export class LLMClient extends EventEmitter {
   async *streamChat(
     messages: LLMMessage[],
     tools?: LLMToolDef[],
-    options?: { temperature?: number; topP?: number; topK?: number; maxTokens?: number; disableReasoning?: boolean; reasoningBudget?: number }
+    options?: { temperature?: number; topP?: number; topK?: number; maxTokens?: number; disableReasoning?: boolean; reasoningBudget?: number; signal?: AbortSignal }
   ): AsyncGenerator<LLMStreamChunk> {
     this.refreshProviders();
     let lastError: Error | null = null;
@@ -377,10 +383,30 @@ export class LLMClient extends EventEmitter {
           requestBody.tool_choice = 'auto';
         }
 
+        // Merge user-defined custom request body properties (e.g. extra_body, request_params, custom chat_template)
+        if (provider.rawProvider?.extra_body) {
+          requestBody.extra_body = mergeObjects(requestBody.extra_body ?? {}, provider.rawProvider.extra_body);
+        }
+        if (provider.rawModel?.extra_body) {
+          requestBody.extra_body = mergeObjects(requestBody.extra_body ?? {}, provider.rawModel.extra_body);
+        }
+        if (provider.rawProvider?.request_params) {
+          Object.assign(requestBody, provider.rawProvider.request_params);
+        }
+        if (provider.rawModel?.request_params) {
+          Object.assign(requestBody, provider.rawModel.request_params);
+        }
+        if (provider.rawProvider?.chat_template) {
+          requestBody.chat_template = provider.rawProvider.chat_template;
+        }
+        if (provider.rawModel?.chat_template) {
+          requestBody.chat_template = provider.rawModel.chat_template;
+        }
+
         // ─── Sanitization for Non-Local Providers ───
         // Google and other strict providers will return 400 if they see unknown fields
         // like 'reasoning', 'reasoning_format', etc.
-        const stream = await client.chat.completions.create(requestBody);
+        const stream = await client.chat.completions.create(requestBody, { signal: options?.signal });
 
         // Track tool call accumulation across chunks.
         // Some providers stream native tool_calls, while smaller/local models
@@ -391,8 +417,8 @@ export class LLMClient extends EventEmitter {
         let isDsmlCalling = false;
         let tagBuffer = '';
 
-        // Watchdog timeout between chunks (60s)
-        const watchdogStream = withTimeout(stream as any, 60_000);
+        // Watchdog timeout between chunks (180s for slow local prefill/large prompts)
+        const watchdogStream = withTimeout(stream as any, 180_000);
 
         for await (const chunk of watchdogStream as any) {
           const delta = chunk.choices?.[0]?.delta;
@@ -689,12 +715,33 @@ export class LLMClient extends EventEmitter {
       const maxAttempts = isRetryFriendlyProvider(provider) ? 3 : 1;
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
-          const response = await client.chat.completions.create({
+          const requestBody: any = {
             model: provider.model,
             messages: normalizeMessagesForProvider(messages, provider, false) as any,
             max_tokens: options?.maxTokens ?? 2048,
             temperature: 0.3,
-          }, {
+          };
+
+          if (provider.rawProvider?.extra_body) {
+            requestBody.extra_body = mergeObjects(requestBody.extra_body ?? {}, provider.rawProvider.extra_body);
+          }
+          if (provider.rawModel?.extra_body) {
+            requestBody.extra_body = mergeObjects(requestBody.extra_body ?? {}, provider.rawModel.extra_body);
+          }
+          if (provider.rawProvider?.request_params) {
+            Object.assign(requestBody, provider.rawProvider.request_params);
+          }
+          if (provider.rawModel?.request_params) {
+            Object.assign(requestBody, provider.rawModel.request_params);
+          }
+          if (provider.rawProvider?.chat_template) {
+            requestBody.chat_template = provider.rawProvider.chat_template;
+          }
+          if (provider.rawModel?.chat_template) {
+            requestBody.chat_template = provider.rawModel.chat_template;
+          }
+
+          const response = await client.chat.completions.create(requestBody, {
             signal: AbortSignal.timeout(60_000),
           });
           return response.choices[0]?.message?.content ?? '';
@@ -791,6 +838,13 @@ function buildProviderDefinition(
   apiKey: string,
 ): LLMProvider {
   const modelId = String(model.id ?? '');
+  
+  // Fully customizable via model config OR provider config
+  const supportsTools = model.tools ?? model.supportsTools ?? providerConfig.tools ?? providerConfig.supportsTools ?? true;
+  const supportsReasoning = model.reasoning ?? model.supportsReasoning ?? providerConfig.reasoning ?? providerConfig.supportsReasoning ?? inferSupportsReasoning(provId, baseUrl, modelId, model.reasoning);
+  const supportsVision = model.vision ?? model.supportsVision ?? providerConfig.vision ?? providerConfig.supportsVision ?? (model.input?.includes('image') ?? false);
+  const supportsTopK = model.topK ?? model.supportsTopK ?? providerConfig.topK ?? providerConfig.supportsTopK ?? inferSupportsTopK(provId, baseUrl, modelId, model.supportsTopK);
+
   return {
     id: `${provId}/${modelId}`,
     providerId: provId,
@@ -799,10 +853,10 @@ function buildProviderDefinition(
     model: modelId,
     contextWindow: model.contextWindow ?? 65536,
     maxTokens: model.maxTokens ?? 8192,
-    supportsVision: model.vision ?? (model.input?.includes('image') ?? false),
-    supportsTools: model.tools ?? true,
-    supportsReasoning: inferSupportsReasoning(provId, baseUrl, modelId, model.reasoning),
-    supportsTopK: inferSupportsTopK(provId, baseUrl, modelId, model.supportsTopK),
+    supportsVision,
+    supportsTools,
+    supportsReasoning,
+    supportsTopK,
     rawProvider: providerConfig,
     rawModel: model,
   };
@@ -1148,6 +1202,17 @@ function normalizeMessagesForProvider(
       }
     }
 
+    if (typeof content === 'string') {
+      content = content.toWellFormed();
+    } else if (Array.isArray(content)) {
+      content = content.map(part => {
+        if (part.type === 'text' && typeof part.text === 'string') {
+          return { ...part, text: part.text.toWellFormed() };
+        }
+        return part;
+      });
+    }
+
     if (strictProvider && message.role === 'assistant' && message.tool_calls?.length && flattenMessageContent(content ?? '').trim().length === 0) {
       normalized.content = '';
     } else {
@@ -1160,10 +1225,11 @@ function normalizeMessagesForProvider(
 
 function flattenMessageContent(content: string | LLMContentPart[] | null): string {
   if (!content) return '';
-  if (typeof content === 'string') return content;
+  if (typeof content === 'string') return content.toWellFormed();
   return content
-    .map(part => part.type === 'text' ? (part.text ?? '') : `[image:${part.image_url?.detail ?? 'auto'}]`)
-    .join('\n');
+    .map(part => part.type === 'text' ? (part.text?.toWellFormed() ?? '') : `[image:${part.image_url?.detail ?? 'auto'}]`)
+    .join('\n')
+    .toWellFormed();
 }
 
 function normalizeNativeToolResultContent(content: string | LLMContentPart[] | null): string {

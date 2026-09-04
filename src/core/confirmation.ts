@@ -16,8 +16,10 @@ export interface PendingConfirmation {
   id: string;
   toolName: string;
   description: string;
-  channelType: 'webui' | 'discord' | 'whatsapp' | 'cli';
+  channelType: 'webui' | 'discord' | 'whatsapp' | 'cli' | 'subagent';
   channelTarget?: string;
+  requesterId?: string;
+  requiredOwner?: boolean;
   createdAt: number;
   timeoutMs: number;
   resolve: (confirmed: boolean) => void;
@@ -41,17 +43,19 @@ export class ConfirmationManager extends EventEmitter {
   async requestConfirmation(
     toolName: string,
     description: string,
-    channelType: 'webui' | 'discord' | 'whatsapp' | 'cli',
-    channelTarget?: string
+    channelType: 'webui' | 'discord' | 'whatsapp' | 'cli' | 'subagent',
+    channelTarget?: string,
+    options?: { requesterId?: string; requiredOwner?: boolean; timeoutMs?: number }
   ): Promise<boolean> {
     const id = `confirm_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const timeoutMs = options?.timeoutMs ?? this.defaultTimeoutMs;
 
     return new Promise<boolean>((resolve) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
         log.info({ id }, 'Confirmation timed out — defaulting to reject');
         resolve(false);
-      }, this.defaultTimeoutMs);
+      }, timeoutMs);
 
       const confirmation: PendingConfirmation = {
         id,
@@ -59,8 +63,10 @@ export class ConfirmationManager extends EventEmitter {
         description,
         channelType,
         channelTarget,
+        requesterId: options?.requesterId,
+        requiredOwner: options?.requiredOwner ?? true,
         createdAt: Date.now(),
-        timeoutMs: this.defaultTimeoutMs,
+        timeoutMs,
         resolve: (confirmed: boolean) => {
           clearTimeout(timeout);
           this.pending.delete(id);

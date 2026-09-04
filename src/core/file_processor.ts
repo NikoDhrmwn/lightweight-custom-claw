@@ -60,3 +60,34 @@ export async function processFile(name: string, dataUrl: string, timeoutMs: numb
     return { name, type: mime, content: `[Error reading file ${name}: ${error.message}]` };
   }
 }
+
+export async function readFileFormatted(filePath: string): Promise<string> {
+  const { readFileSync } = await import('fs');
+  const { basename } = await import('path');
+
+  const ext = filePath.toLowerCase().substring(filePath.lastIndexOf('.'));
+  const buffer = readFileSync(filePath);
+
+  if (ext === '.xlsx' || ext === '.xls') {
+    const workbook = XLSX.read(buffer, { type: 'buffer' });
+    const lines: string[] = [`📊 Excel Workbook: ${basename(filePath)} (Sheets: ${workbook.SheetNames.join(', ')})\n`];
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName];
+      const csv = XLSX.utils.sheet_to_csv(sheet);
+      lines.push(`--- Sheet: ${sheetName} ---\n${csv.trim() || '(empty sheet)'}\n`);
+    }
+    return lines.join('\n');
+  }
+
+  if (ext === '.pdf') {
+    const data = await pdf(buffer);
+    return `📄 PDF Document: ${basename(filePath)} (${data.numpages} pages)\n\n${data.text.slice(0, 500_000)}`;
+  }
+
+  if (ext === '.docx' || ext === '.doc') {
+    const result = await mammoth.extractRawText({ buffer });
+    return `📝 Word Document: ${basename(filePath)}\n\n${result.value.slice(0, 500_000)}`;
+  }
+
+  throw new Error(`Unsupported document extension: ${ext}`);
+}

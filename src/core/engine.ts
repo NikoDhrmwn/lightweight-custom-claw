@@ -62,7 +62,7 @@ Do NOT emit <tool_call> XML or raw tool-call JSON in normal text.`
       : `To use a tool, call it with the provider's native function-calling interface.
 Do NOT emit <tool_call> XML or raw tool-call JSON in normal text.
 
-After a tool call, you will receive the tool result in the conversation. Use only ONE tool at a time.`;
+After a tool call, you will receive the tool result in the conversation. You can call multiple tools in parallel if they are independent and help solve the task faster.`;
 
     return `${executionRules}
 
@@ -88,7 +88,7 @@ If you need more tools to reach the objective, emit a <tool_call> block.`
 
 CRITICAL: Always put your multi-step reasoning inside <think> tags before calling a tool. In the final response (outside tags), do NOT narrate your plan. No "I will now check...", no "I need to...". Emit the <tool_call> block immediately after your thoughts. Any text outside of <think> or <tool_call> tags while a tool is being used is forbidden.
 
-After emitting a tool call, you will receive a <tool_result> message. Use only ONE tool at a time.`;
+After emitting a tool call, you will receive a <tool_result> message. You may emit multiple <tool_call> blocks consecutively in a single turn if they can run in parallel.`;
 
   return `${executionRules}
 
@@ -109,12 +109,23 @@ export interface AgentRequest {
   sessionKey: string;
   disablePlanner?: boolean;
   disableReasoning?: boolean;
-  channelType: 'webui' | 'discord' | 'whatsapp' | 'cli';
+  channelType: 'webui' | 'discord' | 'whatsapp' | 'cli' | 'subagent';
   channelTarget?: string;
   userIdentifier?: string;
   workingDir?: string;
   sendFile?: (filePath: string, fileName?: string) => Promise<void>;
   sendInteractiveChoice?: (request: import('./tools.js').InteractiveChoiceRequest) => Promise<string>;
+  sendPoll?: (poll: { name: string; options: string[]; selectableCount?: number }) => Promise<string>;
+  sendEvent?: (event: {
+    name: string;
+    description?: string;
+    startDate: Date;
+    endDate?: Date;
+    location?: string;
+    call?: 'audio' | 'video';
+  }) => Promise<string>;
+  react?: (emoji: string) => Promise<void>;
+  messageKey?: any;
   /** Override the system prompt entirely (e.g., for DnD GM mode) */
   systemPromptOverride?: string;
 }
@@ -190,12 +201,19 @@ type InternalDirectEvent =
   | { type: 'final_result'; content: string }
   | { type: 'switch_to_plan'; plan?: TaskPlan };
 
+let defaultAgentEngine: AgentEngine | null = null;
+
+export function getDefaultAgentEngine(): AgentEngine | null {
+  return defaultAgentEngine;
+}
+
 export class AgentEngine extends EventEmitter {
   private llm: LLMClient;
   private context: ContextManager;
   private memory: MemoryStore;
   private confirmations: ConfirmationManager;
   private sessionLocks = new Map<string, Promise<void>>();
+  private activeAborts = new Map<string, AbortController>();
 
   constructor(
     llm: LLMClient,
@@ -207,6 +225,7 @@ export class AgentEngine extends EventEmitter {
     this.context = new ContextManager(llm);
     this.memory = memory;
     this.confirmations = confirmations;
+    defaultAgentEngine = this;
   }
 
   getLLMClient(): LLMClient {
@@ -215,6 +234,57 @@ export class AgentEngine extends EventEmitter {
 
   getMemory(): MemoryStore {
     return this.memory;
+  }
+
+  /**
+   * Abort an active running session turn if one is in flight.
+   */
+  abortSession(sessionKey: string): boolean {
+    const ac = this.activeAborts.get(sessionKey);
+    if (ac) {
+      ac.abort();
+      this.activeAborts.delete(sessionKey);
+      log.info({ sessionKey }, 'Aborted active session execution');
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Spawns an isolated subagent for a delegated subtask and returns its synthesized output.
+   */
+  async executeSubagent(
+    task: string,
+    options?: {
+      parentSessionKey?: string;
+      context?: string;
+      workingDir?: string;
+    }
+  ): Promise<string> {
+    const subagentSessionKey = `subagent:${options?.parentSessionKey || 'root'}:${Date.now()}`;
+    const prompt = [
+      `[SUBAGENT DELEGATION TASK]`,
+      `Objective: ${task}`,
+      options?.context ? `Context & Background:\n${options.context}` : '',
+      `Instructions: Investigate, execute required tools, and synthesize a clear, comprehensive summary of your findings for the parent agent.`,
+    ].filter(Boolean).join('\n\n');
+
+    const request: AgentRequest = {
+      sessionKey: subagentSessionKey,
+      message: prompt,
+      channelType: 'subagent',
+      workingDir: options?.workingDir,
+      disablePlanner: true,
+    };
+
+    let result = '';
+    for await (const event of this.processRequest(request)) {
+      if (event.type === 'content' && event.content) {
+        result += event.content;
+      }
+    }
+
+    return result.trim() || '(Subagent completed execution without output)';
   }
 
   private async acquireLock(sessionKey: string): Promise<() => void> {
@@ -232,9 +302,12 @@ export class AgentEngine extends EventEmitter {
 
   async *processRequest(request: AgentRequest): AsyncGenerator<AgentStreamEvent> {
     const release = await this.acquireLock(request.sessionKey);
+    const abortController = new AbortController();
+    this.activeAborts.set(request.sessionKey, abortController);
     try {
-      yield* this._processRequest(request);
+      yield* this._processRequest(request, abortController.signal);
     } finally {
+      this.activeAborts.delete(request.sessionKey);
       log.debug({ sessionKey: request.sessionKey }, 'Releasing session lock');
       release();
     }
@@ -250,7 +323,7 @@ export class AgentEngine extends EventEmitter {
     });
   }
 
-  private async *_processRequest(request: AgentRequest): AsyncGenerator<AgentStreamEvent> {
+  private async *_processRequest(request: AgentRequest, signal?: AbortSignal): AsyncGenerator<AgentStreamEvent> {
     const startTime = Date.now();
     let totalTokens = 0;
     let allThinkingContent = '';
@@ -267,7 +340,7 @@ export class AgentEngine extends EventEmitter {
 
     if (!usePlanner) {
       let switchedToPlan = false;
-      for await (const event of this.runAndSaveDirectConversation(request, prepared, startTime, totalTokens, allThinkingContent)) {
+      for await (const event of this.runAndSaveDirectConversation(request, prepared, startTime, totalTokens, allThinkingContent, signal)) {
         if (event.type === 'switch_to_plan') {
           switchedToPlan = true;
           log.info({ session: request.sessionKey }, 'Model requested plan autonomously');
@@ -582,10 +655,11 @@ export class AgentEngine extends EventEmitter {
     startTime: number,
     totalTokens: number,
     allThinkingContent: string,
+    signal?: AbortSignal,
   ): AsyncGenerator<AgentStreamEvent> {
     let finalResponse = '';
     let streamedContent = false;
-    for await (const event of this.runDirectConversation(request, prepared)) {
+    for await (const event of this.runDirectConversation(request, prepared, signal)) {
       if (event.type === 'final_result') {
         finalResponse = event.content;
         continue;
@@ -634,6 +708,7 @@ export class AgentEngine extends EventEmitter {
   private async *runDirectConversation(
     request: AgentRequest,
     prepared: PreparedRequestContext,
+    signal?: AbortSignal,
   ): AsyncGenerator<InternalFinalEvent> {
     const config = getConfig();
     const maxIterations = config.agent?.maxTurns ?? 20;
@@ -683,7 +758,8 @@ export class AgentEngine extends EventEmitter {
         topP: llmDefaults?.topP,
         topK: llmDefaults?.topK,
         maxTokens: llmDefaults?.maxOutputTokens,
-        disableReasoning: request.disableReasoning
+        disableReasoning: request.disableReasoning,
+        signal,
       })) {
         if (chunk.type === 'thinking' && chunk.content) {
           thinkingContent += chunk.content;
@@ -755,6 +831,14 @@ export class AgentEngine extends EventEmitter {
             continue;
           }
 
+          // Graceful fallback: if thinkingContent has content, deliver it rather than terminating with an error
+          const fallback = thinkingContent.trim();
+          if (fallback && !isLikelyHiddenReasoning(fallback)) {
+            yield { type: 'content', content: fallback };
+            fullResponse = fallback;
+            break;
+          }
+
           yield { type: 'error', error: 'Model reached stagnation after multiple planning attempts without action.' };
           yield { type: 'final_result', content: assistantContent };
           return;
@@ -804,15 +888,24 @@ export class AgentEngine extends EventEmitter {
         const toolContext: ToolContext = {
           channelType: request.channelType,
           channelTarget: request.channelTarget,
+          sessionKey: request.sessionKey,
+          messageKey: request.messageKey,
           workingDir: request.workingDir ?? process.cwd(),
           sendFile: request.sendFile,
           sendInteractiveChoice: request.sendInteractiveChoice,
+          sendPoll: request.sendPoll,
+          sendEvent: request.sendEvent,
+          react: request.react,
           requestConfirmation: async (description: string) => {
             return this.confirmations.requestConfirmation(
               tc.function.name,
               description,
               request.channelType,
               request.channelTarget,
+              {
+                requesterId: request.userIdentifier || request.channelTarget,
+                requiredOwner: true,
+              }
             );
           },
         };
@@ -971,7 +1064,7 @@ export class AgentEngine extends EventEmitter {
     systemPrompt += `\n\n# Task Execution Rules
 You are executing one task inside an internal task plan.
 Stay focused on the current task only.
-Use one tool at a time when needed.
+Use tools when needed. You may call multiple tools in parallel to expedite the work.
 Do not answer the user directly during task execution.
 
 ${buildToolUseInstructions(nativeToolsEnabled, true)}
@@ -1153,15 +1246,24 @@ Do not expose the internal plan outside tags.`;
         const toolContext: ToolContext = {
           channelType: request.channelType,
           channelTarget: request.channelTarget,
+          sessionKey: request.sessionKey,
+          messageKey: request.messageKey,
           workingDir: request.workingDir ?? process.cwd(),
           sendFile: request.sendFile,
           sendInteractiveChoice: request.sendInteractiveChoice,
+          sendPoll: request.sendPoll,
+          sendEvent: request.sendEvent,
+          react: request.react,
           requestConfirmation: async (description: string) => {
             return this.confirmations.requestConfirmation(
               call.function.name,
               description,
               request.channelType,
               request.channelTarget,
+              {
+                requesterId: request.userIdentifier || request.channelTarget,
+                requiredOwner: true,
+              }
             );
           },
         };
@@ -1397,8 +1499,22 @@ Do not expose the internal plan outside tags.`;
       12,
     );
 
-    if (selectedByTask.length > 0) return selectedByTask;
-    return prepared.selectedTools;
+    // Build a merged set starting from the request-level selection so tools that
+    // scored well against the original user message (e.g. web_search) are never
+    // silently dropped because the planner generated a vague task title.
+    const merged = new Map<string, ToolDefinition>();
+    for (const tool of prepared.selectedTools) merged.set(tool.name, tool);
+    for (const tool of selectedByTask) merged.set(tool.name, tool);
+
+    // Always force-include any tool the planner explicitly listed in suggestedTools.
+    for (const toolName of task.suggestedTools) {
+      if (!merged.has(toolName)) {
+        const tool = toolRegistry.get(toolName);
+        if (tool) merged.set(toolName, tool);
+      }
+    }
+
+    return Array.from(merged.values());
   }
 
   private buildUserMessage(request: AgentRequest): LLMMessage {
@@ -1706,14 +1822,51 @@ function inferSafeToolCall(
   return null;
 }
 
+/**
+ * Safely slices a string without breaking UTF-16 surrogate pairs (e.g. emojis),
+ * ensuring the resulting substring is always well-formed Unicode.
+ */
+function safeSlice(str: string, start?: number, end?: number): string {
+  if (!str) return '';
+  let s = start ?? 0;
+  if (s < 0) s = Math.max(0, str.length + s);
+
+  if (s > 0 && s < str.length) {
+    const code = str.charCodeAt(s);
+    if (code >= 0xDC00 && code <= 0xDFFF) {
+      s++;
+    }
+  }
+
+  let e = end ?? str.length;
+  if (e < 0) e = Math.max(0, str.length + e);
+
+  if (e > 0 && e < str.length) {
+    const code = str.charCodeAt(e - 1);
+    if (code >= 0xD800 && code <= 0xDBFF) {
+      e--;
+    }
+  }
+
+  if (s >= e) return '';
+  return str.slice(s, e).toWellFormed();
+}
+
 function truncateToolOutput(output: string, maxChars: number): string {
-  if (output.length <= maxChars) return output;
+  if (!output) return '';
+  const wellFormed = output.toWellFormed();
+  if (wellFormed.length <= maxChars) return wellFormed;
   const half = Math.floor(maxChars / 2);
-  return `${output.slice(0, half)}\n\n... [truncated ${output.length - maxChars} chars] ...\n\n${output.slice(-half)}`;
+  const head = safeSlice(wellFormed, 0, half);
+  const tail = safeSlice(wellFormed, -half);
+  return `${head}\n\n... [truncated ${wellFormed.length - maxChars} chars] ...\n\n${tail}`.toWellFormed();
 }
 
 function formatToolResultForModel(toolName: string, result: ToolResult): string {
-  const output = truncateToolOutput(result.output, 2000);
+  // Allow expansive context for reading files and scripts (up to 120,000 characters)
+  // so needle-in-a-haystack tests and large code files are preserved
+  const maxChars = (toolName === 'read_file' || toolName === 'exec') ? 120_000 : 8_000;
+  const output = truncateToolOutput(result.output, maxChars);
   let content = `<tool_result>\n{"tool":"${toolName}","success":${result.success ? 'true' : 'false'}}\n</tool_result>\n\n${output}`;
 
   if (!result.success) {
@@ -1722,7 +1875,7 @@ function formatToolResultForModel(toolName: string, result: ToolResult): string 
     content += `\n\n[SYSTEM: The tool "${toolName}" succeeded. Use the results above to continue the task or emit a <task_update> if the objective is now met.]`;
   }
 
-  return content;
+  return content.toWellFormed();
 }
 
 function normalizeTaskId(id: string, fallbackIndex: number): string {
@@ -1816,28 +1969,29 @@ function isLikelyHiddenReasoning(text: string): boolean {
 
   if (!cleaned) return false;
 
-  if (/^`[\s\S]{0,800}$/m.test(text) && /\b(import |def |subprocess|requests?|python|bash|powershell|curl)\b/i.test(text)) {
+  // If the text contains markdown code blocks or code constructs, it is user-facing code, NEVER hidden reasoning!
+  if (/```[\s\S]*?```/.test(text) || /\b(return\s+|console\.log|print\(|def\s+[a-z0-9_]+\s*\(|function\s+[a-z0-9_]+\s*\()/i.test(text)) {
+    return false;
+  }
+
+  // If the text is long and descriptive (> 300 chars), it's a substantive answer, not an aborted thought
+  if (cleaned.length > 300) {
+    return false;
+  }
+
+  // Explicit planning / thinking headers
+  if (/^\s*(task plan|thought process|internal reasoning:?|scratchpad:?)\b/i.test(cleaned)) {
     return true;
   }
 
-  if (/^\s*(task plan|searching for|thought process|reasoning:)\b/i.test(cleaned)) {
-    return true;
-  }
-
+  // Pure aborted action intent prefixes (short sentences stating what it's about to do without doing it)
   return [
-    /^i need to\b/i,
-    /^let me\b/i,
-    /^i(?:'|’)ll\b/i,
-    /^i will\b/i,
-    /^i should\b/i,
-    /^i(?:'|’)m going to\b/i,
-    /^first[, ]/i,
-    /^to answer this[, ]/i,
-    /\buse (?:the )?[a-z0-9_]+\b/i,
-    /\b(search|check|look up|inspect|compare|analyze|review|read|open|fetch)\b.+\b(first|before|then)\b/i,
-    /\bthe agent could not complete\b/i,
-    /\b(searching for|researching|cross[- ]?checking|looking up)\b/i,
-    /\bimport subprocess\b/i,
-    /\bdef [a-z_]+\(/i,
+    /^i need to (?:check|search|find|read|look|fetch|call|run|execute)\b/i,
+    /^let me (?:check|search|find|read|look|fetch|call|run|execute)\b/i,
+    /^i(?:'|’)ll (?:check|search|find|read|look|fetch|call|run|execute)\b/i,
+    /^i will (?:check|search|find|read|look|fetch|call|run|execute)\b/i,
+    /^i should (?:check|search|find|read|look|fetch|call|run|execute)\b/i,
+    /^i(?:'|’)m going to (?:check|search|find|read|look|fetch|call|run|execute)\b/i,
+    /^first[, ]\s*(?:i need to|let me|i will)\b/i,
   ].some((pattern) => pattern.test(cleaned));
 }

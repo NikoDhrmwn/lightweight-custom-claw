@@ -9,7 +9,7 @@ import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 import { existsSync, readdirSync, readFileSync, statSync, watchFile, unwatchFile } from 'fs';
-import { join, dirname, relative, resolve, sep } from 'path';
+import { join, dirname, relative, resolve, sep, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { AgentEngine, AgentRequest, AgentStreamEvent } from '../core/engine.js';
 import { ConfirmationManager, buildWebUIConfirmation } from '../core/confirmation.js';
@@ -19,6 +19,7 @@ import { MemoryStore } from '../core/memory.js';
 import { getConfig, getConfigPath, getStateDir, loadConfig, reloadConfig, saveConfig, type LiteClawConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 import { processFile } from '../core/file_processor.js';
+import { WebUIVoiceSession } from '../voice/webui-voice.js';
 
 const log = createLogger('gateway');
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -31,13 +32,14 @@ interface WSAttachment {
 }
 
 interface WSMessage {
-  type: 'message' | 'confirmation_response' | 'ping' | 'session_init';
+  type: 'message' | 'confirmation_response' | 'ping' | 'session_init' | 'voice_start' | 'voice_stop' | 'voice_close';
   content?: string;
   attachments?: WSAttachment[];
   confirmationId?: string;
   confirmed?: boolean;
   sessionKey?: string;
   workingDir?: string;
+  mode?: 'vad' | 'push-to-talk';
 }
 
 // ─── Gateway Server ──────────────────────────────────────────────────
@@ -50,6 +52,7 @@ export class GatewayServer {
   private confirmations: ConfirmationManager;
   private clients = new Set<WebSocket>();
   private watchedFiles = new Set<string>();
+  private voiceSessions = new Map<WebSocket, WebUIVoiceSession>();
 
   constructor(engine: AgentEngine, confirmations: ConfirmationManager) {
     this.engine = engine;
@@ -542,6 +545,27 @@ export class GatewayServer {
           narrativeMaxTokens: config.extensions?.dnd?.narrativeMaxTokens ?? 4096,
         },
       },
+      voice: {
+        enabled: !!config.voice?.enabled,
+        asr: {
+          serverUrl: config.voice?.asr?.serverUrl ?? 'http://localhost:8089/transcribe',
+          chunkSizeMs: config.voice?.asr?.chunkSizeMs ?? 160,
+          language: config.voice?.asr?.language ?? 'en',
+        },
+        tts: {
+          serverUrl: config.voice?.tts?.serverUrl ?? 'http://localhost:8090/v1/audio/speech',
+          voiceRef: config.voice?.tts?.voiceRef ?? 'auto',
+          modelName: config.voice?.tts?.modelName ?? 'omnivoice',
+          sampleRate: config.voice?.tts?.sampleRate ?? 24000,
+        },
+        vad: {
+          silenceDurationMs: config.voice?.vad?.silenceDurationMs ?? 300,
+          energyThreshold: config.voice?.vad?.energyThreshold ?? 0.01,
+        },
+        triggerMode: config.voice?.triggerMode ?? 'always',
+        wakeName: config.voice?.wakeName ?? '',
+        maxResponseTokens: config.voice?.maxResponseTokens ?? 150,
+      },
     };
   }
 
@@ -578,6 +602,17 @@ export class GatewayServer {
 
       ws.on('message', async (raw) => {
         try {
+          // Check if message is binary audio data from the browser mic
+          const isBuffer = Buffer.isBuffer(raw);
+          const isProbablyJson = isBuffer && raw.toString().trim().startsWith('{');
+          if (isBuffer && !isProbablyJson) {
+            const voiceSession = this.voiceSessions.get(ws);
+            if (voiceSession) {
+              voiceSession.handleAudioChunk(raw);
+            }
+            return;
+          }
+
           const msg: WSMessage = JSON.parse(raw.toString());
 
           switch (msg.type) {
@@ -605,6 +640,38 @@ export class GatewayServer {
             case 'ping':
               ws.send(JSON.stringify({ type: 'pong' }));
               break;
+
+            case 'voice_start': {
+              const sessionKey = msg.sessionKey ?? 'webui:default';
+              const mode = msg.mode === 'push-to-talk' ? 'push-to-talk' : 'vad';
+              // Cleanup existing session if any
+              const existing = this.voiceSessions.get(ws);
+              if (existing) {
+                existing.close();
+              }
+              const session = new WebUIVoiceSession(ws, this.engine, { mode, sessionKey });
+              this.voiceSessions.set(ws, session);
+              log.info({ sessionKey, mode }, 'Started WebUI voice session');
+              break;
+            }
+
+            case 'voice_stop': {
+              const session = this.voiceSessions.get(ws);
+              if (session) {
+                await session.stopPushToTalk();
+              }
+              break;
+            }
+
+            case 'voice_close': {
+              const session = this.voiceSessions.get(ws);
+              if (session) {
+                session.close();
+                this.voiceSessions.delete(ws);
+                log.info('Closed WebUI voice session');
+              }
+              break;
+            }
           }
         } catch (err: any) {
           log.error({ error: err.message }, 'WebSocket message error');
@@ -614,6 +681,11 @@ export class GatewayServer {
 
       ws.on('close', () => {
         this.clients.delete(ws);
+        const voiceSession = this.voiceSessions.get(ws);
+        if (voiceSession) {
+          voiceSession.close();
+          this.voiceSessions.delete(ws);
+        }
         log.info({ clients: this.clients.size }, 'WebUI client disconnected');
       });
 
@@ -689,6 +761,32 @@ export class GatewayServer {
       sessionKey,
       channelType: 'webui',
       workingDir: this.resolveWorkspace(msg.workingDir),
+      sendFile: async (filePath: string, fileName?: string) => {
+        try {
+          if (!existsSync(filePath)) {
+            throw new Error('File does not exist');
+          }
+          const data = readFileSync(filePath);
+          const base64Data = data.toString('base64');
+          const name = fileName ?? basename(filePath);
+          
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'file_download',
+              name,
+              data: base64Data,
+            }));
+          }
+        } catch (err: any) {
+          log.error({ error: err.message, filePath }, 'Failed to send file to WebUI');
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              content: `Failed to send file: ${err.message}`
+            }));
+          }
+        }
+      },
     };
 
     log.info({ sessionKey, messageLength: request.message.length, imageCount: images.length }, 'WebUI message received');
@@ -1005,6 +1103,33 @@ function applyConfigPatch(config: LiteClawConfig, patch: Record<string, any>): L
     // Migrate loadoutModel to extensions if set at top-level
     if (next.llm?.defaults?.loadoutModel && !next.extensions.dnd.loadoutModel) {
       next.extensions.dnd.loadoutModel = next.llm.defaults.loadoutModel;
+    }
+  }
+
+  if (patch.voice) {
+    next.voice ??= {};
+    const voice = patch.voice;
+    if (voice.enabled !== undefined) next.voice.enabled = !!voice.enabled;
+    if (voice.triggerMode !== undefined) next.voice.triggerMode = voice.triggerMode === 'wake-word' ? 'wake-word' : 'always';
+    if (voice.wakeName !== undefined) next.voice.wakeName = String(voice.wakeName).trim();
+    if (voice.maxResponseTokens !== undefined) next.voice.maxResponseTokens = Number(voice.maxResponseTokens);
+    if (voice.asr) {
+      next.voice.asr ??= {};
+      if (voice.asr.serverUrl !== undefined) next.voice.asr.serverUrl = String(voice.asr.serverUrl).trim();
+      if (voice.asr.chunkSizeMs !== undefined) next.voice.asr.chunkSizeMs = Number(voice.asr.chunkSizeMs);
+      if (voice.asr.language !== undefined) next.voice.asr.language = String(voice.asr.language).trim();
+    }
+    if (voice.tts) {
+      next.voice.tts ??= {};
+      if (voice.tts.serverUrl !== undefined) next.voice.tts.serverUrl = String(voice.tts.serverUrl).trim();
+      if (voice.tts.voiceRef !== undefined) next.voice.tts.voiceRef = String(voice.tts.voiceRef).trim();
+      if (voice.tts.modelName !== undefined) next.voice.tts.modelName = String(voice.tts.modelName).trim();
+      if (voice.tts.sampleRate !== undefined) next.voice.tts.sampleRate = Number(voice.tts.sampleRate);
+    }
+    if (voice.vad) {
+      next.voice.vad ??= {};
+      if (voice.vad.silenceDurationMs !== undefined) next.voice.vad.silenceDurationMs = Number(voice.vad.silenceDurationMs);
+      if (voice.vad.energyThreshold !== undefined) next.voice.vad.energyThreshold = Number(voice.vad.energyThreshold);
     }
   }
 

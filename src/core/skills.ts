@@ -5,7 +5,7 @@
  * most relevant ones into the model prompt for the current request.
  */
 
-import { existsSync, readdirSync, readFileSync } from 'fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import YAML from 'yaml';
@@ -182,3 +182,39 @@ function tokenize(text: string): Set<string> {
       .match(/[a-z0-9_.-]{3,}/g)?.filter(token => !STOPWORDS.has(token)) ?? []
   );
 }
+
+export function invalidateSkillCache(): void {
+  cachedKey = '';
+  cachedSkills = [];
+}
+
+export function getSkillByName(name: string): LoadedSkill | null {
+  const catalog = loadSkillCatalog();
+  const normalized = name.toLowerCase().trim();
+  return catalog.find(s => s.name.toLowerCase() === normalized) ?? null;
+}
+
+export function saveSkill(name: string, description: string, body: string, customDir?: string): string {
+  const stateDir = getStateDir();
+  const targetBaseDir = customDir ?? join(stateDir, 'skills');
+  const safeName = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+  const skillDir = join(targetBaseDir, safeName);
+
+  if (!existsSync(skillDir)) {
+    mkdirSync(skillDir, { recursive: true });
+  }
+
+  const skillPath = join(skillDir, 'SKILL.md');
+  const frontmatter = YAML.stringify({
+    name: safeName,
+    description: description.trim(),
+  }).trim();
+
+  const fileContent = `---\n${frontmatter}\n---\n\n${body.trim()}\n`;
+  writeFileSync(skillPath, fileContent, 'utf-8');
+
+  invalidateSkillCache();
+  log.info({ skill: safeName, path: skillPath }, 'Saved skill to catalog');
+  return skillPath;
+}
+

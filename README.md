@@ -11,6 +11,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [1.0.1] - 2026-09-04
+
+#### Fixed
+
+- **Plan-mode web search** — tools selected at request-time (e.g. `web_search`) were silently dropped during per-task tool resolution because vague planner-generated task titles didn't re-trigger keyword scoring. `resolveTaskTools()` now merges the request-level selection with per-task scoring and force-includes any tool explicitly listed in `task.suggestedTools`.
+
+### [1.0.0] - 2026-09-04
+
+#### Added
+
+- **Persistent Long-Term Memory**: `manage_memory` tool (remember / recall / view / update) backed by `MEMORY.md` injected into every system prompt. `/memory` slash command on WhatsApp and Discord.
+- **Cross-Session FTS5 Search**: Full-text search across all messages via `search_history` tool and `/search <query>` slash command.
+- **Session Control**: `/retry`, `/undo`, `/stop` slash commands for replaying, undoing, or aborting the current turn, backed by `AbortController` threading through the engine.
+- **Subagent Delegation**: `delegate_task` tool spawns isolated child agent sessions for parallel or long-running sub-tasks.
+- **Code Execution Sandbox**: `run_code` tool supporting Python, JavaScript, TypeScript, and PowerShell.
+- **Self-Improving Skills Loop**: `manage_skills` tool (list / view / create / update) persists reusable skill templates with SQLite-tracked usage analytics.
+- **Usage Analytics**: `getUsageStats()` aggregation and `/insights [days]` slash command.
+- **Persistent Kanban Board**: `manage_kanban` tool with full CRUD and `/tasks` / `/kanban` slash commands.
+- System prompt updated with guidance sections for all new v1.0 tools.
+
 ### [0.8.4] - 2026-05-08
 
 #### Added

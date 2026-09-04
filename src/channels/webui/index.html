@@ -84,6 +84,7 @@
             <span class="health-dot" id="healthDot"></span>
             <span id="healthLabel">Health</span>
           </span>
+          <button class="header-action-btn" id="voiceLoungeBtn" type="button">🎙 Voice Lounge</button>
           <button class="header-action-btn" id="exportBtn" type="button">Export</button>
           <button class="header-action-btn" id="clearBtn" type="button">Clear</button>
         </div>
@@ -292,6 +293,25 @@
               </label>
               <label class="check-line"><input id="toggleWhatsappToolProgress" type="checkbox"><span>Show tool progress</span></label>
             </div>
+            <div class="subcard">
+              <div class="subcard-head">Voice Chat</div>
+              <label class="check-line"><input id="toggleVoiceEnabled" type="checkbox"><span>Enabled</span></label>
+              <label class="field">
+                <span>Trigger mode</span>
+                <select id="settingVoiceTriggerMode">
+                  <option value="always">Always</option>
+                  <option value="wake-word">Wake word</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Wake name</span>
+                <input id="settingVoiceWakeName" type="text" placeholder="liteclaw">
+              </label>
+              <label class="field">
+                <span>Max response tokens</span>
+                <input id="settingVoiceMaxResponseTokens" type="number" placeholder="150">
+              </label>
+            </div>
           </div>
         </section>
 
@@ -393,6 +413,73 @@
       <div class="settings-actions">
         <button class="cta cta-solid" id="saveSettingsBtn" type="button">Save settings</button>
         <button class="cta cta-outline dangerish" id="clearAllBtn" type="button">Delete all sessions</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Voice Lounge Overlay ──────────────────────────────────────── -->
+  <div class="settings-overlay" id="voiceLoungeOverlay" hidden>
+    <div class="settings-panel voice-lounge-panel">
+      <div class="drawer-head">
+        <div>
+          <div class="eyebrow">Interactive Space</div>
+          <h3>🎙 Voice Lounge</h3>
+          <div class="drawer-subtitle" id="voiceStatusLabel">Disconnected</div>
+        </div>
+        <button class="drawer-close" id="closeVoiceLoungeBtn" type="button">×</button>
+      </div>
+
+      <div class="voice-main-area">
+        <!-- Visualizer canvas with glowing orb/wave -->
+        <div class="visualizer-container">
+          <canvas id="voiceVisualizer" width="360" height="180"></canvas>
+          <div class="visualizer-overlay-info">
+            <span class="voice-state-dot" id="voiceStateDot"></span>
+            <span class="voice-state-label" id="voiceStateLabel">Ready to connect</span>
+          </div>
+        </div>
+
+        <div class="voice-controls">
+          <button class="cta cta-solid" id="toggleVoiceConnectBtn" type="button">Connect Microphone</button>
+          
+          <div class="voice-setting-row">
+            <label class="check-line">
+              <input id="voiceMuteCheckbox" type="checkbox" disabled>
+              <span>Mute Mic</span>
+            </label>
+            <label class="field" style="margin-left: 15px;">
+              <span>Trigger Mode</span>
+              <select id="voiceTriggerModeSelect">
+                <option value="vad">Continuous (VAD)</option>
+                <option value="push-to-talk">Push to Talk</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="voice-setting-row" style="flex-direction: column; gap: 10px; align-items: stretch;">
+            <label class="field" style="width: 100%;">
+              <span>Input Device (Microphone)</span>
+              <select id="voiceInputDeviceSelect">
+                <option value="">Default Microphone</option>
+              </select>
+            </label>
+            <label class="field" style="width: 100%; margin-top: 8px !important;">
+              <span>Output Device (Speaker/Headphones)</span>
+              <select id="voiceOutputDeviceSelect">
+                <option value="">Default Speaker</option>
+              </select>
+            </label>
+          </div>
+
+          <button class="cta cta-outline" id="pttBtn" type="button" style="display: none;" disabled>HOLD TO TALK</button>
+        </div>
+
+        <div class="voice-transcript-container">
+          <div class="section-label">Session Transcript</div>
+          <div class="voice-transcript" id="voiceTranscript">
+            <div class="transcript-placeholder">Your voice conversation history will show up here...</div>
+          </div>
+        </div>
       </div>
     </div>
   </div>

@@ -15,7 +15,7 @@ import makeWASocket, {
   type BaileysEventMap,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
-import { existsSync, mkdirSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join, basename, extname } from 'path';
 import { lookup } from 'mime-types';
 import { AgentEngine, AgentRequest, AgentStreamEvent } from '../core/engine.js';
@@ -36,6 +36,12 @@ import {
   type ChannelProgressState,
 } from './progress.js';
 import { unfurlUrl, downloadUnfurledMedia } from './utils.js';
+import { channelRegistry } from './registry.js';
+import { parseScheduleTime } from '../core/scheduler.js';
+import { processFile } from '../core/file_processor.js';
+import { ownerRegistry } from '../core/owner.js';
+import { visionService } from '../core/vision.js';
+import { readMemoryFile } from '../core/personality_memory.js';
 
 const log = createLogger('whatsapp');
 const baileysLog = createSilentLogger('baileys');
@@ -83,6 +89,50 @@ export class WhatsAppChannel {
     if (!existsSync(this.sessionDir)) {
       mkdirSync(this.sessionDir, { recursive: true });
     }
+
+    channelRegistry.register('whatsapp', {
+      sendMessage: async (target: string, content: string, options?: any) => {
+        return this.sendMessageWithRetry(target, { text: content, ...options });
+      },
+      sendPoll: async (target: string, poll: { name: string; options: string[]; selectableCount?: number }) => {
+        const sent = await this.sendMessageWithRetry(target, {
+          poll: {
+            name: poll.name,
+            values: poll.options,
+            selectableCount: poll.selectableCount ?? 1,
+          },
+        });
+        return sent?.key?.id ?? '';
+      },
+      sendEvent: async (target: string, event: {
+        name: string;
+        description?: string;
+        startDate: Date;
+        endDate?: Date;
+        location?: string;
+        call?: 'audio' | 'video';
+      }) => {
+        const sent = await this.sendMessageWithRetry(target, {
+          event: {
+            name: event.name,
+            description: event.description,
+            startDate: event.startDate,
+            endDate: event.endDate,
+            location: event.location ? { name: event.location, degreesLatitude: 0, degreesLongitude: 0 } : undefined,
+            call: event.call,
+          },
+        });
+        return sent?.key?.id ?? '';
+      },
+      sendFile: async (target: string, filePath: string, fileName?: string) => {
+        return this.sendFile(target, filePath, fileName);
+      },
+      react: async (target: string, messageKey: any, emoji: string) => {
+        if (this.sock && messageKey) {
+          await this.sock.sendMessage(target, { react: { text: emoji, key: messageKey } });
+        }
+      },
+    });
 
     this.setupConfirmationHandler();
   }
@@ -160,6 +210,15 @@ export class WhatsAppChannel {
           await this.handleMessage(msg, unwrapped);
         }
       });
+
+      // Handle poll vote updates
+      this.sock.ev.on('messages.update', async (updates) => {
+        for (const update of updates) {
+          if (update.update?.pollUpdates) {
+            log.info({ pollMsg: update.key?.id, updates: update.update.pollUpdates }, 'WhatsApp poll update received');
+          }
+        }
+      });
     } catch (err: any) {
       log.error({ error: err.message }, 'Failed to start WhatsApp channel');
       this.isReconnecting = true;
@@ -193,20 +252,145 @@ export class WhatsAppChannel {
       case 'help':
         await this.sendMessageWithRetry(jid, {
           text: `*LiteClaw Commands*\n\n` +
-                `*/reset* - Clear conversation history\n` +
-                `*/status* - Show current status\n` +
-                `*/help* - Show this help message\n` +
-                `*/clear* - Alias for /reset`
+                `*/reset* or */clear* - Clear conversation history for this chat\n` +
+                `*/clear <session>* - Clear a specific session\n` +
+                `*/clear all* - Clear all sessions\n` +
+                `*/status* - Show agent and system uptime status\n` +
+                `*/tokens* or */usage* - Show token consumption & context limits\n` +
+                `*/sessions* - List all active sessions\n` +
+                `*/owner* - View registered owner\n` +
+                `*/register-owner* - Register yourself as the instance owner\n` +
+                `*/poll <question> | <opt1> | <opt2> ...* - Send a native WhatsApp poll\n` +
+                `*/event <title> | <time> | [desc]* - Send a native WhatsApp event card\n` +
+                `*/remind <time> | <message>* - Schedule an autonomous reminder\n` +
+                `*/retry* - Re-run the last turn with a fresh attempt\n` +
+                `*/undo* - Revert the last conversation exchange\n` +
+                `*/stop* - Immediately stop currently executing agent task\n` +
+                `*/memory* - View persistent facts (MEMORY.md) and profile (USER.md)\n` +
+                `*/search <query>* - Search full-text conversation history (FTS5)\n` +
+                `*/insights [days]* - View token usage and activity metrics\n` +
+                `*/tasks* or */kanban* - View active Kanban task board\n` +
+                `*/help* - Show this message`
         });
         return true;
 
-      case 'reset':
-      case 'clear':
-        this.engine.getMemory().clearSession(sessionKey);
-        await this.sendMessageWithRetry(jid, { text: '🗑 *History cleared.* Starting a fresh conversation.' });
+      case 'retry': {
+        const lastUser = this.engine.getMemory().getLastUserMessage(sessionKey);
+        if (!lastUser) {
+          await this.sendMessageWithRetry(jid, { text: '⚠️ No previous turn to retry.' });
+          return true;
+        }
+        this.engine.getMemory().undoLastExchange(sessionKey);
+        await this.sendMessageWithRetry(jid, { text: `🔄 *Retrying turn:* "${lastUser.content.slice(0, 100)}..."` });
+        await this.handleMessage(msg, { conversation: lastUser.content });
         return true;
+      }
 
-      case 'status':
+      case 'undo': {
+        const result = this.engine.getMemory().undoLastExchange(sessionKey);
+        if (result.removedCount === 0) {
+          await this.sendMessageWithRetry(jid, { text: '⚠️ No previous exchange found to undo.' });
+        } else {
+          await this.sendMessageWithRetry(jid, {
+            text: `↩️ *Undid last exchange* (${result.removedCount} messages removed).\nPrevious message was: "${(result.undoneUserMessage || '').slice(0, 120)}..."`
+          });
+        }
+        return true;
+      }
+
+      case 'stop': {
+        const stopped = this.engine.abortSession(sessionKey);
+        if (stopped) {
+          await this.sendMessageWithRetry(jid, { text: '⏹️ *Current agent turn stopped.*' });
+        } else {
+          await this.sendMessageWithRetry(jid, { text: 'ℹ️ No active agent task is currently running.' });
+        }
+        return true;
+      }
+
+      case 'memory': {
+        const mem = readMemoryFile('memory');
+        const usr = readMemoryFile('user');
+        await this.sendMessageWithRetry(jid, {
+          text: `🧠 *Persistent Agent Memory*\n\n` +
+                `*👤 USER.md*\n${usr.slice(0, 1000) || '(empty)'}\n\n` +
+                `*📝 MEMORY.md*\n${mem.slice(0, 1000) || '(empty)'}`
+        });
+        return true;
+      }
+
+      case 'search': {
+        const q = args.join(' ').trim();
+        if (!q) {
+          await this.sendMessageWithRetry(jid, { text: 'Usage: `/search <query>`' });
+          return true;
+        }
+        const matches = this.engine.getMemory().searchFTS(q, 5);
+        if (matches.length === 0) {
+          await this.sendMessageWithRetry(jid, { text: `🔍 No history found for "${q}".` });
+          return true;
+        }
+        const formatted = matches.map(m => `• [${new Date(m.timestamp).toLocaleDateString()}] *${m.role}*: ${m.content.slice(0, 150)}...`).join('\n\n');
+        await this.sendMessageWithRetry(jid, { text: `🔍 *History Results for "${q}":*\n\n${formatted}` });
+        return true;
+      }
+
+      case 'insights': {
+        const days = Math.max(1, Math.min(90, Number(args[0]) || 7));
+        const stats = this.engine.getMemory().getUsageStats(days);
+        const topSess = stats.topSessions.map(s => `• \`${s.sessionKey.slice(0, 20)}\`: ${s.messageCount} msgs (~${s.estimatedTokens.toLocaleString()} tokens)`).join('\n');
+        await this.sendMessageWithRetry(jid, {
+          text: `📊 *Agent Usage Insights (Last ${days} Days)*\n\n` +
+                `💬 *Total Messages:* ${stats.totalMessages.toLocaleString()} (${stats.userMessages} user, ${stats.assistantMessages} bot)\n` +
+                `🔑 *Active Sessions:* ${stats.totalSessions}\n` +
+                `🪙 *Estimated Tokens:* ~${stats.estimatedTokens.toLocaleString()}\n\n` +
+                `*Top Active Sessions:*\n${topSess || '(none)'}`
+        });
+        return true;
+      }
+
+      case 'tasks':
+      case 'kanban': {
+        const userKey = sessionKey.split(':')[0] || 'default';
+        const boards = this.engine.getMemory().listKanbanBoards(userKey);
+        if (boards.length === 0) {
+          await this.sendMessageWithRetry(jid, { text: '📋 No Kanban boards found. Tell the agent "create a task board for X".' });
+          return true;
+        }
+        const board = boards[0];
+        const cards = this.engine.getMemory().listKanbanCards(board.id);
+        const formatted = cards.slice(0, 10).map(c => `• [${c.columnName.toUpperCase()}] *${c.title}* ${c.priority ? `(${c.priority})` : ''}`).join('\n');
+        await this.sendMessageWithRetry(jid, {
+          text: `📋 *Kanban Board: ${board.name}*\n\n${formatted || '(empty board)'}`
+        });
+        return true;
+      }
+
+      case 'reset':
+      case 'clear': {
+        if (args[0] === 'all') {
+          const sessions = this.engine.getMemory().listSessions();
+          for (const s of sessions) {
+            this.engine.getMemory().clearSession(s.sessionKey);
+          }
+          await this.sendMessageWithRetry(jid, { text: `🗑 *All ${sessions.length} sessions cleared.* Starting fresh.` });
+          return true;
+        } else if (args[0] && args[0].includes(':')) {
+          const target = args[0].trim();
+          this.engine.getMemory().clearSession(target);
+          await this.sendMessageWithRetry(jid, { text: `🗑 *Session "${target}" cleared.*` });
+          return true;
+        } else {
+          const metrics = this.engine.getMemory().getSessionMetrics(sessionKey);
+          this.engine.getMemory().clearSession(sessionKey);
+          await this.sendMessageWithRetry(jid, {
+            text: `🗑 *History cleared for this chat.*\nFreed ~${metrics.estimatedTokens.toLocaleString()} tokens across ${metrics.messageCount} messages.`
+          });
+          return true;
+        }
+      }
+
+      case 'status': {
         const metrics = this.engine.getMemory().getSessionMetrics(sessionKey);
         const uptime = process.uptime();
         await this.sendMessageWithRetry(jid, {
@@ -214,10 +398,233 @@ export class WhatsAppChannel {
                 `🤖 *Agent:* ${this.config.agent?.name || 'Molty'}\n` +
                 `⏳ *Uptime:* ${formatDurationShort(uptime * 1000)}\n` +
                 `💬 *Messages:* ${metrics.messageCount}\n` +
-                `🪙 *Tokens used:* ~${metrics.estimatedTokens}\n` +
+                `🪙 *Tokens used:* ~${metrics.estimatedTokens.toLocaleString()}\n` +
                 `📅 *Last activity:* ${metrics.lastActivity ? new Date(metrics.lastActivity).toLocaleString() : 'never'}`
         });
         return true;
+      }
+
+      case 'tokens':
+      case 'usage': {
+        const metrics = this.engine.getMemory().getSessionMetrics(sessionKey);
+        await this.sendMessageWithRetry(jid, {
+          text: `*📊 Session Token & Context Metrics*\n\n` +
+                `🔑 *Session:* \`${sessionKey}\`\n` +
+                `💬 *Messages:* ${metrics.messageCount} (Images: ${metrics.imageCount})\n` +
+                `🪙 *Estimated Tokens:* ~${metrics.estimatedTokens.toLocaleString()}\n` +
+                `📦 *Context Budget:* ~${(metrics.budgetTokens ?? 51200).toLocaleString()} tokens (Max: ${(metrics.maxContextTokens ?? 64000).toLocaleString()})\n` +
+                `📈 *Budget Used:* ${metrics.usagePct ?? 0}%\n` +
+                `⚡ *Soft Compaction:* ${(metrics.softThresholdTokens ?? 46080).toLocaleString()} tokens (${metrics.compactionThresholdPct ?? 90}%)\n` +
+                `🛡 *Compaction Status:* ${metrics.isNearCompaction ? '⚠️ Near compaction threshold' : '✅ Healthy'}`
+        });
+        return true;
+      }
+
+      case 'sessions': {
+        const sessions = this.engine.getMemory().listSessions().slice(0, 15);
+        if (sessions.length === 0) {
+          await this.sendMessageWithRetry(jid, { text: '📋 *No active sessions recorded.*' });
+          return true;
+        }
+        const lines = [`*📋 Active Sessions (${sessions.length})*:\n`];
+        for (const s of sessions) {
+          const isCurrent = s.sessionKey === sessionKey ? ' 👈 _(here)_' : '';
+          const user = s.userIdentifier ? ` (${s.userIdentifier})` : '';
+          const last = s.lastActivity ? new Date(s.lastActivity).toLocaleDateString() : 'Never';
+          lines.push(`• \`${s.sessionKey}\`${user}${isCurrent}\n  💬 ${s.messageCount} msgs | 🪙 ~${(s.estimatedTokens ?? 0).toLocaleString()} tok | 📅 ${last}`);
+        }
+        await this.sendMessageWithRetry(jid, { text: lines.join('\n') });
+        return true;
+      }
+
+      case 'poll': {
+        const rawArgs = text.slice(cmd.length + 1).trim();
+        const parts = rawArgs.split('|').map(p => p.trim()).filter(Boolean);
+        if (parts.length < 3) {
+          await this.sendMessageWithRetry(jid, {
+            text: '⚠️ *Usage:* `/poll Question | Option 1 | Option 2 | [Option 3]...`'
+          });
+          return true;
+        }
+        const [question, ...options] = parts;
+        await this.sendMessageWithRetry(jid, {
+          poll: {
+            name: question,
+            values: options.slice(0, 12),
+            selectableCount: 1,
+          }
+        });
+        return true;
+      }
+
+      case 'event': {
+        const rawArgs = text.slice(cmd.length + 1).trim();
+        const parts = rawArgs.split('|').map(p => p.trim()).filter(Boolean);
+        if (parts.length < 2) {
+          await this.sendMessageWithRetry(jid, {
+            text: '⚠️ *Usage:* `/event Title | Start Time (e.g. tomorrow at 15:00) | [Description]`'
+          });
+          return true;
+        }
+        const title = parts[0];
+        const timeMs = parseScheduleTime(parts[1]);
+        if (!timeMs) {
+          await this.sendMessageWithRetry(jid, {
+            text: `⚠️ Could not parse time "${parts[1]}". Example: "in 2 hours", "tomorrow at 10am".`
+          });
+          return true;
+        }
+        const desc = parts[2] || undefined;
+        await this.sendMessageWithRetry(jid, {
+          event: {
+            name: title,
+            description: desc,
+            startDate: new Date(timeMs),
+          }
+        });
+        return true;
+      }
+
+      case 'remind': {
+        const rawArgs = text.slice(cmd.length + 1).trim();
+        const pipeIdx = rawArgs.indexOf('|');
+        let timeStr = '';
+        let reminderText = '';
+        if (pipeIdx !== -1) {
+          timeStr = rawArgs.slice(0, pipeIdx).trim();
+          reminderText = rawArgs.slice(pipeIdx + 1).trim();
+        } else {
+          const parts = rawArgs.split(/\s+/);
+          timeStr = parts[0];
+          reminderText = parts.slice(1).join(' ');
+        }
+        const timeMs = parseScheduleTime(timeStr);
+        if (!timeMs || !reminderText) {
+          await this.sendMessageWithRetry(jid, {
+            text: '⚠️ *Usage:* `/remind <time> | <message>` (e.g. `/remind in 15m | Check server`)'
+          });
+          return true;
+        }
+        const task = this.engine.getMemory().createScheduledTask({
+          sessionKey,
+          channelType: 'whatsapp',
+          channelTarget: jid,
+          triggerAtMs: timeMs,
+          taskType: 'reminder',
+          payload: reminderText,
+        });
+        await this.sendMessageWithRetry(jid, {
+          text: `⏰ *Reminder scheduled* for ${new Date(timeMs).toLocaleString()}:\n"${reminderText}"\n(ID: \`${task.id}\`)`
+        });
+        return true;
+      }
+
+      case 'owner': {
+        const primary = ownerRegistry.getPrimaryOwner('whatsapp');
+        const owners = ownerRegistry.getOwners('whatsapp');
+        if (owners.length === 0 && !primary) {
+          await this.sendMessageWithRetry(jid, {
+            text: '👑 *No owner registered yet.*\nSend `/register-owner` to register yourself as the Absolute Owner.'
+          });
+        } else {
+          const lines = ['👑 *Authorized Owners (WhatsApp):*'];
+          if (primary) {
+            lines.push(`• 🌟 *Absolute Owner:* ${primary.displayName ? `*${primary.displayName}* ` : ''}(\`${primary.ownerId}\`)`);
+          }
+          const secondary = owners.filter(o => !primary || ownerRegistry.normalizeId(o.ownerId) !== ownerRegistry.normalizeId(primary.ownerId));
+          for (const s of secondary) {
+            lines.push(`• 🛡️ *Owner:* ${s.displayName ? `*${s.displayName}* ` : ''}(\`${s.ownerId}\`)`);
+          }
+          await this.sendMessageWithRetry(jid, { text: lines.join('\n') });
+        }
+        return true;
+      }
+
+      case 'register-owner': {
+        const senderJid = msg.key.participant || jid;
+        const senderName = msg.pushName || senderJid.split('@')[0];
+        const primary = ownerRegistry.getPrimaryOwner('whatsapp');
+
+        // Case 1: No owner registered yet -> sender becomes Absolute Owner
+        if (!primary && !ownerRegistry.hasAnyOwner('whatsapp')) {
+          ownerRegistry.registerOwner('whatsapp', senderJid, senderName, true);
+          await this.sendMessageWithRetry(jid, {
+            text: `👑 *Success!* You are now registered as the *Absolute Owner* of this LiteClaw instance (@${senderName} - \`${senderJid}\`).\n\n` +
+                  `Any future \`/register-owner\` attempts by other users will require your approval via message.`
+          });
+          return true;
+        }
+
+        // Case 2: Sender is already Absolute Owner
+        if (primary && ownerRegistry.isPrimaryOwner('whatsapp', senderJid)) {
+          await this.sendMessageWithRetry(jid, {
+            text: `👑 You are already the *Absolute Owner* (@${senderName}).`
+          });
+          return true;
+        }
+
+        // Case 3: Sender is already a registered secondary owner
+        if (ownerRegistry.isOwner('whatsapp', senderJid)) {
+          await this.sendMessageWithRetry(jid, {
+            text: `🛡️ You are already a registered owner (@${senderName}).`
+          });
+          return true;
+        }
+
+        // Case 4: Other user requesting owner access -> require approval from the Absolute Owner!
+        if (!primary) {
+          await this.sendMessageWithRetry(jid, {
+            text: `⚠️ Cannot request owner access: No Absolute Owner found.`
+          });
+          return true;
+        }
+
+        const primaryTarget = primary.ownerId.includes('@') ? primary.ownerId : `${primary.ownerId}@s.whatsapp.net`;
+
+        await this.sendMessageWithRetry(jid, {
+          text: `⏳ *Registration Pending Approval:*\n` +
+                `Your request to become an authorized owner has been forwarded to the Absolute Owner (@${primary.displayName || primary.ownerId.split('@')[0]}). ` +
+                `You will be notified once they respond.`
+        });
+
+        // Request approval from the Absolute Owner
+        void (async () => {
+          try {
+            const approved = await this.confirmations.requestConfirmation(
+              'register_owner',
+              `User @${senderName} (${senderJid}) wants to be registered as an authorized owner.`,
+              'whatsapp',
+              primaryTarget,
+              {
+                requesterId: senderJid,
+                requiredOwner: true,
+                timeoutMs: 120_000,
+              }
+            );
+
+            if (approved) {
+              ownerRegistry.registerOwner('whatsapp', senderJid, senderName, false);
+              await this.sendMessageWithRetry(jid, {
+                text: `🎉 *Registration Approved!*\n` +
+                      `The Absolute Owner has approved your request. You (@${senderName}) are now an authorized owner.`
+              });
+              if (primaryTarget !== jid) {
+                await this.sendMessageWithRetry(primaryTarget, {
+                  text: `✅ User @${senderName} (\`${senderJid}\`) has been successfully registered as an authorized owner.`
+                });
+              }
+            } else {
+              await this.sendMessageWithRetry(jid, {
+                text: `❌ *Registration Denied:*\nThe Absolute Owner rejected or did not respond to your registration request.`
+              });
+            }
+          } catch (err: any) {
+            log.error({ error: err.message }, 'Error during owner registration approval flow');
+          }
+        })();
+
+        return true;
+      }
 
       default:
         return false;
@@ -247,17 +654,131 @@ export class WhatsAppChannel {
       content = messageContent.imageMessage.caption;
     }
 
+    const isGroup = jid.endsWith('@g.us');
+    const senderJid = msg.key.participant || jid;
+    const senderLabel = msg.pushName || senderJid.split('@')[0];
+
+    // If this is a direct message and no owner is registered yet, auto-register as owner
+    if (!isGroup && !ownerRegistry.hasAnyOwner('whatsapp')) {
+      ownerRegistry.registerOwner('whatsapp', senderJid, senderLabel);
+      log.info({ senderJid, senderLabel }, 'Auto-registered first DM user as instance owner');
+    }
+
+    // Process incoming documents & media attachments
+    const attachments: Array<{ name: string; dataUrl: string }> = [];
+    const incomingDir = join(getStateDir(), 'incoming');
+    const docMsg = messageContent?.documentMessage || messageContent?.documentWithCaptionMessage?.message?.documentMessage;
+
+    if (docMsg) {
+      try {
+        if (!existsSync(incomingDir)) mkdirSync(incomingDir, { recursive: true });
+        const fileName = docMsg.fileName || `document_${Date.now()}`;
+        if (docMsg.caption) content = docMsg.caption;
+
+        const buffer = await this.downloadMedia(msg);
+        if (buffer) {
+          const localPath = join(incomingDir, `${Date.now()}_${fileName}`);
+          writeFileSync(localPath, buffer);
+
+          const mime = docMsg.mimetype || lookup(fileName) || 'application/octet-stream';
+          const dataUrl = `data:${mime};base64,${buffer.toString('base64')}`;
+          attachments.push({ name: fileName, dataUrl });
+
+          let extractedText = '';
+          try {
+            const processed = await processFile(fileName, dataUrl);
+            extractedText = processed.content;
+          } catch (e: any) {
+            extractedText = `[Error parsing document: ${e.message}]`;
+          }
+
+          const docHeader = `📎 [Received Document: "${fileName}" saved to: ${localPath}]`;
+          const docBody = extractedText ? `\n\n--- FILE: ${fileName} ---\n${extractedText}\n--- END FILE ---` : '';
+          content = content ? `${content}\n\n${docHeader}${docBody}` : `${docHeader}${docBody}`;
+        }
+      } catch (err: any) {
+        log.warn({ error: err.message }, 'Failed to download WhatsApp document');
+      }
+    }
+
+    if (messageContent?.audioMessage) {
+      try {
+        if (!existsSync(incomingDir)) mkdirSync(incomingDir, { recursive: true });
+        const buffer = await this.downloadMedia(msg);
+        if (buffer) {
+          const audioPath = join(incomingDir, `${Date.now()}_voice_note.ogg`);
+          writeFileSync(audioPath, buffer);
+          const audioHeader = `🎤 [Voice Note received and saved to: ${audioPath}]`;
+          content = content ? `${content}\n\n${audioHeader}` : audioHeader;
+        }
+      } catch (err: any) {
+        log.warn({ error: err.message }, 'Failed to download WhatsApp audio');
+      }
+    }
+
+    // Process incoming image with Florence-2 Large
+    if (messageContent?.imageMessage) {
+      try {
+        const buffer = await this.downloadMedia(msg);
+        if (buffer) {
+          try {
+            const visionResult = await visionService.analyzeImage(buffer);
+            content = content ? `${content}\n\n${visionResult.formattedContext}` : visionResult.formattedContext;
+          } catch (e: any) {
+            log.warn({ error: e.message }, 'Failed to analyze image with Florence-2');
+          }
+        }
+      } catch (err: any) {
+        log.warn({ error: err.message }, 'Failed to download WhatsApp image');
+      }
+    }
+
+    // Process incoming sticker with Florence-2 Large
+    if (messageContent?.stickerMessage) {
+      try {
+        const buffer = await this.downloadMedia(msg);
+        if (buffer) {
+          try {
+            const visionResult = await visionService.analyzeImage(buffer);
+            content = content ? `${content}\n\n${visionResult.formattedContext}` : visionResult.formattedContext;
+          } catch (e: any) {
+            log.warn({ error: e.message }, 'Failed to describe sticker with Florence-2');
+          }
+        }
+      } catch (err: any) {
+        log.warn({ error: err.message }, 'Failed to download WhatsApp sticker');
+      }
+    }
+
+    // Process incoming video / animated GIF with Florence-2 Large
+    if (messageContent?.videoMessage) {
+      try {
+        const buffer = await this.downloadMedia(msg);
+        if (buffer) {
+          try {
+            const visionResult = await visionService.analyzeImage(buffer);
+            content = content ? `${content}\n\n${visionResult.formattedContext}` : visionResult.formattedContext;
+          } catch (e: any) {
+            log.warn({ error: e.message }, 'Failed to analyze video/GIF with Florence-2');
+          }
+        }
+      } catch (err: any) {
+        log.warn({ error: err.message }, 'Failed to download WhatsApp video/GIF');
+      }
+    }
+
     const mentionTargets = this.extractMentionTargets(msg, messageContent);
     const replyContext = this.extractReplyContext(messageContent);
 
     const images = await this.collectIncomingImages(msg, messageContent);
 
-    if (!content && images.length === 0) return;
+    if (!content && images.length === 0 && attachments.length === 0) return;
 
     log.info({
       from: jid.replace('@s.whatsapp.net', ''),
       contentLength: content.length,
       hasImages: images.length > 0,
+      hasAttachments: attachments.length > 0,
     }, 'WhatsApp message received');
 
     // Build session key
@@ -278,15 +799,55 @@ export class WhatsAppChannel {
           mentionTargets,
           replyContext,
         },
-        content || '(image attached)'
+        content || '(attachment received)'
       ),
       images: images.length > 0 ? images : undefined,
+      attachments: attachments.length > 0 ? attachments : undefined,
       sessionKey,
       channelType: 'whatsapp',
       channelTarget: jid,
       userIdentifier: msg.pushName || jid.split('@')[0],
+      messageKey: msg.key,
       sendFile: async (filePath: string, fileName?: string) => {
         await this.sendFile(jid, filePath, fileName);
+      },
+      sendInteractiveChoice: async (choiceReq) => {
+        const sent = await this.sendMessageWithRetry(jid, {
+          poll: {
+            name: choiceReq.prompt,
+            values: choiceReq.options,
+            selectableCount: 1,
+          },
+        });
+        return sent?.key?.id ?? '';
+      },
+      sendPoll: async (poll) => {
+        const sent = await this.sendMessageWithRetry(jid, {
+          poll: {
+            name: poll.name,
+            values: poll.options,
+            selectableCount: poll.selectableCount ?? 1,
+          },
+        });
+        return sent?.key?.id ?? '';
+      },
+      sendEvent: async (event) => {
+        const sent = await this.sendMessageWithRetry(jid, {
+          event: {
+            name: event.name,
+            description: event.description,
+            startDate: event.startDate,
+            endDate: event.endDate,
+            location: event.location ? { name: event.location, degreesLatitude: 0, degreesLongitude: 0 } : undefined,
+            call: event.call,
+          },
+        });
+        return sent?.key?.id ?? '';
+      },
+      react: async (emoji) => {
+        if (this.sock) {
+          await this.sock.sendMessage(jid, { react: { text: emoji, key: msg.key } });
+        }
       },
     };
 
@@ -707,14 +1268,44 @@ export class WhatsAppChannel {
             const text = (respMsg.message?.conversation ??
               respMsg.message?.extendedTextMessage?.text ?? '').toLowerCase().trim();
 
-            if (['yes', 'y', 'confirm', '✅'].includes(text)) {
+            const isYes = ['yes', 'y', 'confirm', '✅'].includes(text);
+            const isNo = ['no', 'n', 'cancel', '❌'].includes(text);
+
+            if (!isYes && !isNo) continue;
+
+            const senderJid = respMsg.key.participant || respMsg.key.remoteJid || '';
+
+            // Security check: verify owner status if required
+            if (conf.requiredOwner) {
+              if (conf.toolName === 'register_owner') {
+                const isAbsOwner = ownerRegistry.isPrimaryOwner('whatsapp', senderJid);
+                if (!isAbsOwner) {
+                  log.warn({ senderJid }, 'Non-absolute owner attempted to approve register_owner');
+                  await this.sendMessageWithRetry(jid, {
+                    text: `⛔ *Permission Denied:*\nOnly the *Absolute Owner* can approve new owner registrations.`,
+                  });
+                  continue;
+                }
+              } else {
+                const isOwnerUser = ownerRegistry.isOwner('whatsapp', senderJid);
+                if (!isOwnerUser) {
+                  log.warn({ senderJid, tool: conf.toolName }, 'Non-owner attempted confirmation');
+                  await this.sendMessageWithRetry(jid, {
+                    text: `⛔ *Permission Denied:*\nOnly an authorized owner can confirm \`${conf.toolName}\`.`,
+                  });
+                  continue;
+                }
+              }
+            }
+
+            if (isYes) {
               this.confirmations.resolveConfirmation(conf.id, true);
               this.sock?.ev.off('messages.upsert', handler);
-              await this.sendMessageWithRetry(jid, { text: '✅ Confirmed.' });
-            } else if (['no', 'n', 'cancel', '❌'].includes(text)) {
+              await this.sendMessageWithRetry(jid, { text: `✅ *Confirmed by owner.* Proceeding with \`${conf.toolName}\`...` });
+            } else if (isNo) {
               this.confirmations.resolveConfirmation(conf.id, false);
               this.sock?.ev.off('messages.upsert', handler);
-              await this.sendMessageWithRetry(jid, { text: '❌ Cancelled.' });
+              await this.sendMessageWithRetry(jid, { text: `❌ *Cancelled by owner.*` });
             }
           }
         };
@@ -733,6 +1324,7 @@ export class WhatsAppChannel {
   }
 
   stop(): void {
+    channelRegistry.unregister('whatsapp');
     this.sock?.end(undefined);
   }
 }

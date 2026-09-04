@@ -1,16 +1,15 @@
 /**
- * LiteClaw — Vision Module
- * 
- * Native multimodal vision: images are passed inline as base64
- * in the message array. No separate tool call needed.
- * This module only handles image preprocessing (resize/compress).
- * 
- * Same pattern as OpenWebUI: the model sees images natively.
- * NO tool is registered — the model sees images directly in the
- * multimodal message content. Registering a dummy tool causes
- * the model to call it instead of actually looking at the image.
+ * LiteClaw — Vision & Image Inspection Tools
+ *
+ * Allows the agent to inspect photos, screenshots, diagrams, receipts,
+ * and stickers locally using Microsoft Florence-2-large.
+ * Also provides image preprocessing (resize/compress) for multimodal pipelines.
  */
 
+import { existsSync } from 'fs';
+import { toolRegistry, ToolResult } from '../core/tools.js';
+import { resolveFlexiblePath } from '../core/workspace.js';
+import { visionService } from '../core/vision.js';
 import { getConfig } from '../config.js';
 import { createLogger } from '../logger.js';
 
@@ -30,7 +29,6 @@ export async function preprocessImage(
   const maxPx = maxDimension ?? config.tools?.vision?.maxDimensionPx ?? 1024;
 
   try {
-    // Try to use sharp for resizing
     const sharp = await import('sharp').then(m => m.default).catch(() => null);
 
     if (sharp && Buffer.isBuffer(input)) {
@@ -40,7 +38,6 @@ export async function preprocessImage(
 
       let processed = sharp(input);
 
-      // Only resize if larger than max dimension
       if (width > maxPx || height > maxPx) {
         processed = processed.resize(maxPx, maxPx, { fit: 'inside', withoutEnlargement: true });
       }
@@ -52,14 +49,11 @@ export async function preprocessImage(
     log.warn({ error: err.message }, 'Sharp processing failed, using raw image');
   }
 
-  // Fallback: if input is already a data URI, return as-is
   if (typeof input === 'string') {
     if (input.startsWith('data:')) return input;
-    // Assume raw base64
     return `data:image/jpeg;base64,${input}`;
   }
 
-  // Buffer fallback: return as base64 without resizing
   return `data:image/jpeg;base64,${input.toString('base64')}`;
 }
 
@@ -72,3 +66,59 @@ export function hasImageContent(content: any): boolean {
   }
   return false;
 }
+
+// ─── inspect_image Tool ──────────────────────────────────────────────
+
+toolRegistry.register({
+  name: 'inspect_image',
+  description: 'Inspect, describe, and transcribe (OCR) any image, photo, receipt, diagram, sticker, or screenshot using local Florence-2 Large.',
+  category: 'vision',
+  parameters: [
+    {
+      name: 'path',
+      type: 'string',
+      description: 'Path to the image file (supports "downloads/receipt.jpg", "C:\\...", or relative paths).',
+      required: true,
+    },
+  ],
+  usageNotes: [
+    'Use this whenever the user asks you to check an image, read a receipt, inspect a photo, or transcribe text from an image on disk.',
+    'Supports JPEG, PNG, WebP, BMP, and GIF.'
+  ],
+  examples: [
+    { userIntent: 'inspect receipt in downloads', arguments: { path: 'downloads/receipt.jpg' } },
+    { userIntent: 'read text in screenshot', arguments: { path: 'screenshot.png' } },
+  ],
+  keywords: ['image', 'picture', 'photo', 'receipt', 'screenshot', 'diagram', 'sticker', 'inspect image', 'read image', 'ocr image', 'transcribe image'],
+  handler: async (args, context): Promise<ToolResult> => {
+    const rawPath = args.path as string | undefined;
+    if (!rawPath) {
+      return { success: false, output: 'No image path specified.' };
+    }
+
+    let filePath: string;
+    try {
+      filePath = resolveFlexiblePath(rawPath, context.workingDir).absolute;
+    } catch (err: any) {
+      return { success: false, output: `Path resolution error: ${err.message}` };
+    }
+
+    if (!existsSync(filePath)) {
+      return { success: false, output: `Image file not found: ${filePath}` };
+    }
+
+    try {
+      const analysis = await visionService.analyzeImage(filePath);
+      return {
+        success: true,
+        output: analysis.formattedContext,
+        filePath,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        output: `Failed to inspect image with Florence-2: ${err.message}`,
+      };
+    }
+  },
+});

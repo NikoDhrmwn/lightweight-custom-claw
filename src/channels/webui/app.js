@@ -28,6 +28,23 @@
   let selectedWorkspaceFile = "";
   const attachments = [];
 
+  // Voice Lounge Variables
+  let voiceAudioContext = null;
+  let voiceMicStream = null;
+  let voiceMicSource = null;
+  let voiceScriptProcessor = null;
+  let voiceMicAnalyser = null;
+  let voiceSpeakerAnalyser = null;
+  let isVoiceConnected = false;
+  let isVoiceMuted = false;
+  let voiceTriggerMode = 'vad';
+  let voiceState = 'idle'; // 'idle', 'listening', 'thinking', 'speaking'
+  let voicePlaybackQueue = [];
+  let voicePlayingAudio = false;
+  let voiceActiveAudioSource = null;
+  let voiceAnimationFrameId = null;
+  let spacebarPressed = false;
+
   const $ = (selector) => document.querySelector(selector);
   const messagesEl = $("#messages");
   const sessionListEl = $("#sessionList");
@@ -129,6 +146,10 @@
     settingDndNarrativeTemp: $("#settingDndNarrativeTemp"),
     settingDndNarrativeMaxTokens: $("#settingDndNarrativeMaxTokens"),
     toggleDndAutoProvision: $("#toggleDndAutoProvision"),
+    toggleVoiceEnabled: $("#toggleVoiceEnabled"),
+    settingVoiceTriggerMode: $("#settingVoiceTriggerMode"),
+    settingVoiceWakeName: $("#settingVoiceWakeName"),
+    settingVoiceMaxResponseTokens: $("#settingVoiceMaxResponseTokens"),
   };
 
   // ─── Sidebar Toggle ──────────────────────────────────────────────
@@ -466,6 +487,12 @@
     refs.whatsappReplyStyle.value = config.channels?.whatsapp?.replyStyle || "single";
     refs.toggleWhatsappToolProgress.checked = !!config.channels?.whatsapp?.showToolProgress;
 
+    const voice = config.voice || {};
+    refs.toggleVoiceEnabled.checked = !!voice.enabled;
+    refs.settingVoiceTriggerMode.value = voice.triggerMode || "always";
+    refs.settingVoiceWakeName.value = voice.wakeName || "";
+    refs.settingVoiceMaxResponseTokens.value = voice.maxResponseTokens || 150;
+
     refs.toggleExecEnabled.checked = !!config.tools?.exec?.enabled;
     refs.toggleExecConfirm.checked = !!config.tools?.exec?.confirmDestructive;
     refs.toggleWebFetchEnabled.checked = !!config.tools?.web?.fetchEnabled;
@@ -584,6 +611,12 @@
           replyStyle: refs.whatsappReplyStyle.value,
           showToolProgress: refs.toggleWhatsappToolProgress.checked,
         },
+      },
+      voice: {
+        enabled: refs.toggleVoiceEnabled.checked,
+        triggerMode: refs.settingVoiceTriggerMode.value,
+        wakeName: refs.settingVoiceWakeName.value.trim(),
+        maxResponseTokens: parseInt(refs.settingVoiceMaxResponseTokens.value, 10) || 150,
       },
       tools: {
         exec: {
@@ -1139,6 +1172,17 @@
       case "task_update":
         appendTaskUpdate(msg);
         break;
+      case "file_download": {
+        const dataUrl = `data:application/octet-stream;base64,${msg.data}`;
+        const a = document.createElement("a");
+        a.href = dataUrl;
+        a.download = msg.name || "downloaded_file";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        showNotice(`Downloading ${msg.name}...`, "success");
+        break;
+      }
       case "tool_start":
         appendToolBadge(msg.tool || "tool");
         break;
@@ -1175,6 +1219,18 @@
           renderSessionMetrics();
         }
         loadSessions();
+        break;
+      case "voice_state":
+        setVoiceState(msg.state);
+        break;
+      case "voice_transcription":
+        appendVoiceTranscript(msg.role, msg.content);
+        break;
+      case "voice_audio_chunk":
+        handleVoiceAudioChunk(msg.audio, msg.text);
+        break;
+      case "voice_interrupt":
+        interruptVoicePlayback();
         break;
       case "pong":
         break;
@@ -1879,6 +1935,576 @@
       }
     }
   });
+
+  // ─── Voice Lounge client logic ────────────────────────────────────────
+
+  const voiceLoungeBtn = $("#voiceLoungeBtn");
+  const voiceLoungeOverlay = $("#voiceLoungeOverlay");
+  const closeVoiceLoungeBtn = $("#closeVoiceLoungeBtn");
+  const voiceStatusLabel = $("#voiceStatusLabel");
+  const voiceVisualizer = $("#voiceVisualizer");
+  const toggleVoiceConnectBtn = $("#toggleVoiceConnectBtn");
+  const voiceMuteCheckbox = $("#voiceMuteCheckbox");
+  const voiceTriggerModeSelect = $("#voiceTriggerModeSelect");
+  const voiceInputDeviceSelect = $("#voiceInputDeviceSelect");
+  const voiceOutputDeviceSelect = $("#voiceOutputDeviceSelect");
+  const pttBtn = $("#pttBtn");
+  const voiceTranscript = $("#voiceTranscript");
+  const voiceStateDot = $("#voiceStateDot");
+  const voiceStateLabel = $("#voiceStateLabel");
+
+  let selectedInputDeviceId = localStorage.getItem("liteclaw_voice_input_device") || "";
+  let selectedOutputDeviceId = localStorage.getItem("liteclaw_voice_output_device") || "";
+
+  async function populateVoiceDevices() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      
+      const currentInput = voiceInputDeviceSelect.value || selectedInputDeviceId;
+      const currentOutput = voiceOutputDeviceSelect.value || selectedOutputDeviceId;
+      
+      voiceInputDeviceSelect.innerHTML = '<option value="">Default Microphone</option>';
+      voiceOutputDeviceSelect.innerHTML = '<option value="">Default Speaker</option>';
+      
+      let inputCount = 0;
+      let outputCount = 0;
+      
+      devices.forEach((device) => {
+        if (device.kind === "audioinput") {
+          inputCount++;
+          const label = device.label || `Microphone ${inputCount}`;
+          const option = document.createElement("option");
+          option.value = device.deviceId;
+          option.textContent = label;
+          if (device.deviceId === currentInput) option.selected = true;
+          voiceInputDeviceSelect.appendChild(option);
+        } else if (device.kind === "audiooutput") {
+          outputCount++;
+          const label = device.label || `Speaker/Headphones ${outputCount}`;
+          const option = document.createElement("option");
+          option.value = device.deviceId;
+          option.textContent = label;
+          if (device.deviceId === currentOutput) option.selected = true;
+          voiceOutputDeviceSelect.appendChild(option);
+        }
+      });
+      
+      selectedInputDeviceId = voiceInputDeviceSelect.value;
+      selectedOutputDeviceId = voiceOutputDeviceSelect.value;
+    } catch (err) {
+      console.warn("Failed to enumerate audio devices:", err);
+    }
+  }
+
+  voiceLoungeBtn.addEventListener("click", () => {
+    voiceLoungeOverlay.hidden = false;
+    initVisualizerAnimation();
+    populateVoiceDevices();
+  });
+
+  closeVoiceLoungeBtn.addEventListener("click", () => {
+    voiceLoungeOverlay.hidden = true;
+    disconnectVoice();
+    if (voiceAnimationFrameId) {
+      cancelAnimationFrame(voiceAnimationFrameId);
+      voiceAnimationFrameId = null;
+    }
+  });
+
+  toggleVoiceConnectBtn.addEventListener("click", async () => {
+    if (isVoiceConnected) {
+      disconnectVoice();
+    } else {
+      await connectVoice();
+    }
+  });
+
+  voiceMuteCheckbox.addEventListener("change", () => {
+    isVoiceMuted = voiceMuteCheckbox.checked;
+    voiceStatusLabel.textContent = isVoiceMuted ? "Microphone Muted" : "Microphone Active";
+  });
+
+  voiceTriggerModeSelect.addEventListener("change", () => {
+    voiceTriggerMode = voiceTriggerModeSelect.value;
+    if (voiceTriggerMode === 'push-to-talk') {
+      pttBtn.style.display = "block";
+    } else {
+      pttBtn.style.display = "none";
+    }
+    // If connected, restart session with new mode
+    if (isVoiceConnected) {
+      sendVoiceStart();
+    }
+  });
+
+  voiceInputDeviceSelect.addEventListener("change", async () => {
+    selectedInputDeviceId = voiceInputDeviceSelect.value;
+    localStorage.setItem("liteclaw_voice_input_device", selectedInputDeviceId);
+    
+    if (isVoiceConnected) {
+      showNotice("Switching input device...", "info", 1500);
+      
+      if (voiceMicStream) {
+        voiceMicStream.getTracks().forEach(track => track.stop());
+      }
+      
+      try {
+        const constraints = {
+          audio: selectedInputDeviceId ? { deviceId: { exact: selectedInputDeviceId } } : true,
+          video: false
+        };
+        voiceMicStream = await navigator.mediaDevices.getUserMedia(constraints);
+        
+        if (voiceAudioContext && voiceMicSource) {
+          voiceMicSource.disconnect();
+          voiceMicSource = voiceAudioContext.createMediaStreamSource(voiceMicStream);
+          voiceMicSource.connect(voiceMicAnalyser);
+        }
+      } catch (err) {
+        console.error("Failed to switch input device:", err);
+        showNotice("Failed to switch input device: " + err.message, "error");
+        disconnectVoice();
+      }
+    }
+  });
+
+  voiceOutputDeviceSelect.addEventListener("change", async () => {
+    selectedOutputDeviceId = voiceOutputDeviceSelect.value;
+    localStorage.setItem("liteclaw_voice_output_device", selectedOutputDeviceId);
+    
+    if (voiceAudioContext) {
+      if (typeof voiceAudioContext.setSinkId === 'function') {
+        try {
+          await voiceAudioContext.setSinkId(selectedOutputDeviceId);
+          showNotice("Output device switched.", "success", 1500);
+        } catch (err) {
+          console.error("Failed to switch output device:", err);
+          showNotice("Failed to set audio output device: " + err.message, "error");
+        }
+      } else {
+        showNotice("Custom output device selection not supported by your browser.", "warning", 2500);
+      }
+    }
+  });
+
+  async function connectVoice() {
+    try {
+      toggleVoiceConnectBtn.disabled = true;
+      toggleVoiceConnectBtn.textContent = "Connecting...";
+
+      // Get mic stream using selected device constraint if available
+      const constraints = {
+        audio: selectedInputDeviceId ? { deviceId: { exact: selectedInputDeviceId } } : true,
+        video: false
+      };
+      voiceMicStream = await navigator.mediaDevices.getUserMedia(constraints);
+      
+      // Refresh the device list now that permission is granted and labels are visible
+      await populateVoiceDevices();
+
+      // Initialize AudioContext at 16000Hz (autoresampling!)
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      voiceAudioContext = new AudioCtx({ sampleRate: 16000 });
+
+      // Apply selected output device if set
+      if (selectedOutputDeviceId && typeof voiceAudioContext.setSinkId === 'function') {
+        try {
+          await voiceAudioContext.setSinkId(selectedOutputDeviceId);
+        } catch (err) {
+          console.warn("Failed to set output device sink on init:", err);
+        }
+      }
+
+      if (voiceAudioContext.state === "suspended") {
+        await voiceAudioContext.resume();
+      }
+
+      voiceMicSource = voiceAudioContext.createMediaStreamSource(voiceMicStream);
+      voiceMicAnalyser = voiceAudioContext.createAnalyser();
+      voiceMicAnalyser.fftSize = 256;
+
+      // ScriptProcessorNode buffers mono audio
+      voiceScriptProcessor = voiceAudioContext.createScriptProcessor(2048, 1, 1);
+      
+      voiceMicSource.connect(voiceMicAnalyser);
+      voiceMicAnalyser.connect(voiceScriptProcessor);
+      voiceScriptProcessor.connect(voiceAudioContext.destination);
+
+      voiceScriptProcessor.onaudioprocess = (event) => {
+        if (!isVoiceConnected || isVoiceMuted) return;
+        if (voiceTriggerMode === 'push-to-talk' && !spacebarPressed) return;
+
+        const inputBuffer = event.inputBuffer.getChannelData(0);
+        // Convert Float32 to Int16
+        const pcm = new Int16Array(inputBuffer.length);
+        for (let i = 0; i < inputBuffer.length; i++) {
+          const s = Math.max(-1, Math.min(1, inputBuffer[i]));
+          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+
+        // Send binary frame over WebSocket
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(pcm.buffer);
+        }
+      };
+
+      isVoiceConnected = true;
+      voiceMuteCheckbox.disabled = false;
+      voiceTriggerModeSelect.disabled = false;
+      pttBtn.disabled = false;
+      
+      toggleVoiceConnectBtn.disabled = false;
+      toggleVoiceConnectBtn.textContent = "Disconnect Mic";
+      toggleVoiceConnectBtn.classList.remove("cta-solid");
+      toggleVoiceConnectBtn.classList.add("cta-outline");
+      voiceStatusLabel.textContent = "Microphone Active";
+
+      // Send start message
+      sendVoiceStart();
+      setVoiceState("idle");
+
+    } catch (err) {
+      console.error("Failed to connect microphone:", err);
+      showNotice("Failed to access microphone: " + err.message, "error");
+      disconnectVoice();
+    }
+  }
+
+  function disconnectVoice() {
+    isVoiceConnected = false;
+    
+    // Stop recording tracks
+    if (voiceMicStream) {
+      voiceMicStream.getTracks().forEach(track => track.stop());
+      voiceMicStream = null;
+    }
+
+    if (voiceScriptProcessor) {
+      voiceScriptProcessor.disconnect();
+      voiceScriptProcessor.onaudioprocess = null;
+      voiceScriptProcessor = null;
+    }
+
+    if (voiceMicSource) {
+      voiceMicSource.disconnect();
+      voiceMicSource = null;
+    }
+
+    if (voiceAudioContext) {
+      voiceAudioContext.close().catch(() => {});
+      voiceAudioContext = null;
+    }
+
+    // Stop speaking
+    interruptVoicePlayback();
+
+    toggleVoiceConnectBtn.disabled = false;
+    toggleVoiceConnectBtn.textContent = "Connect Microphone";
+    toggleVoiceConnectBtn.classList.add("cta-solid");
+    toggleVoiceConnectBtn.classList.remove("cta-outline");
+    
+    voiceMuteCheckbox.checked = false;
+    voiceMuteCheckbox.disabled = true;
+    isVoiceMuted = false;
+
+    voiceStatusLabel.textContent = "Disconnected";
+    setVoiceState("idle");
+
+    // Send close message
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "voice_close" }));
+    }
+  }
+
+  function sendVoiceStart() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: "voice_start",
+        mode: voiceTriggerMode,
+        sessionKey: currentSessionKey
+      }));
+    }
+  }
+
+  function setVoiceState(state) {
+    voiceState = state;
+    voiceStateDot.className = "voice-state-dot " + state;
+    voiceStateLabel.textContent = state;
+  }
+
+  function appendVoiceTranscript(role, content) {
+    // Remove placeholder
+    const placeholder = voiceTranscript.querySelector(".transcript-placeholder");
+    if (placeholder) placeholder.remove();
+
+    const bubble = document.createElement("div");
+    bubble.className = "transcript-bubble " + role;
+    bubble.textContent = content;
+    voiceTranscript.appendChild(bubble);
+    voiceTranscript.scrollTop = voiceTranscript.scrollHeight;
+  }
+
+  // Playback queue logic
+  async function handleVoiceAudioChunk(base64Wav, text) {
+    if (!voiceAudioContext) return;
+
+    try {
+      // Decode base64 to binary ArrayBuffer
+      const binary = atob(base64Wav);
+      const len = binary.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+
+      // decode audio
+      const audioBuffer = await voiceAudioContext.decodeAudioData(bytes.buffer);
+      voicePlaybackQueue.push({ buffer: audioBuffer, text });
+      
+      if (!voicePlayingAudio) {
+        playNextVoiceChunk();
+      }
+    } catch (err) {
+      console.error("Failed to decode voice audio:", err);
+    }
+  }
+
+  function playNextVoiceChunk() {
+    if (!isVoiceConnected || voicePlaybackQueue.length === 0) {
+      voicePlayingAudio = false;
+      voiceActiveAudioSource = null;
+      if (voiceState === "speaking") {
+        setVoiceState("idle");
+      }
+      return;
+    }
+
+    voicePlayingAudio = true;
+    setVoiceState("speaking");
+
+    const { buffer, text } = voicePlaybackQueue.shift();
+
+    voiceActiveAudioSource = voiceAudioContext.createBufferSource();
+    voiceActiveAudioSource.buffer = buffer;
+
+    voiceSpeakerAnalyser = voiceAudioContext.createAnalyser();
+    voiceSpeakerAnalyser.fftSize = 256;
+
+    voiceActiveAudioSource.connect(voiceSpeakerAnalyser);
+    voiceSpeakerAnalyser.connect(voiceAudioContext.destination);
+
+    voiceActiveAudioSource.onended = () => {
+      playNextVoiceChunk();
+    };
+
+    voiceActiveAudioSource.start(0);
+  }
+
+  function interruptVoicePlayback() {
+    if (voiceActiveAudioSource) {
+      try {
+        voiceActiveAudioSource.stop();
+      } catch (e) {}
+      voiceActiveAudioSource = null;
+    }
+    voicePlaybackQueue = [];
+    voicePlayingAudio = false;
+  }
+
+  // PTT Keyboard support
+  window.addEventListener("keydown", (e) => {
+    if (!isVoiceConnected || voiceTriggerMode !== 'push-to-talk') return;
+    if (e.code === "Space") {
+      // Don't trigger if user is typing in a text field
+      const activeEl = document.activeElement;
+      if (activeEl && (activeEl.tagName === "INPUT" || activeEl.tagName === "TEXTAREA" || activeEl.isContentEditable)) {
+        return;
+      }
+      e.preventDefault();
+      if (!spacebarPressed) {
+        spacebarPressed = true;
+        pttBtn.classList.add("active");
+        pttBtn.textContent = "SPEAKING...";
+        // Tell server voice started
+        sendVoiceStart();
+        setVoiceState("listening");
+      }
+    }
+  });
+
+  window.addEventListener("keyup", (e) => {
+    if (!isVoiceConnected || voiceTriggerMode !== 'push-to-talk') return;
+    if (e.code === "Space") {
+      const activeEl = document.activeElement;
+      if (activeEl && (activeEl.tagName === "INPUT" || activeEl.tagName === "TEXTAREA" || activeEl.isContentEditable)) {
+        return;
+      }
+      e.preventDefault();
+      if (spacebarPressed) {
+        spacebarPressed = false;
+        pttBtn.classList.remove("active");
+        pttBtn.textContent = "HOLD TO TALK";
+        // Tell server voice stopped
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "voice_stop" }));
+        }
+      }
+    }
+  });
+
+  // PTT Mouse/Touch support
+  pttBtn.addEventListener("mousedown", () => {
+    if (!isVoiceConnected || voiceTriggerMode !== 'push-to-talk') return;
+    spacebarPressed = true;
+    pttBtn.textContent = "SPEAKING...";
+    sendVoiceStart();
+    setVoiceState("listening");
+  });
+
+  const stopPttMouse = () => {
+    if (!isVoiceConnected || voiceTriggerMode !== 'push-to-talk' || !spacebarPressed) return;
+    spacebarPressed = false;
+    pttBtn.textContent = "HOLD TO TALK";
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "voice_stop" }));
+    }
+  };
+
+  pttBtn.addEventListener("mouseup", stopPttMouse);
+  pttBtn.addEventListener("mouseleave", stopPttMouse);
+  pttBtn.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    if (!isVoiceConnected || voiceTriggerMode !== 'push-to-talk') return;
+    spacebarPressed = true;
+    pttBtn.textContent = "SPEAKING...";
+    sendVoiceStart();
+    setVoiceState("listening");
+  });
+  pttBtn.addEventListener("touchend", stopPttMouse);
+
+  // Visualizer Animation
+  function initVisualizerAnimation() {
+    if (voiceAnimationFrameId) return;
+
+    const ctx = voiceVisualizer.getContext("2d");
+    const width = voiceVisualizer.width;
+    const height = voiceVisualizer.height;
+
+    function renderVisualizerFrame() {
+      voiceAnimationFrameId = requestAnimationFrame(renderVisualizerFrame);
+      ctx.clearRect(0, 0, width, height);
+
+      if (voiceState === 'listening' && voiceMicAnalyser) {
+        // Draw Microphone Oscilloscope Wave
+        const bufferLength = voiceMicAnalyser.frequencyBinCount;
+        const dataArray = new Uint8Array(bufferLength);
+        voiceMicAnalyser.getByteTimeDomainData(dataArray);
+
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = "rgba(120, 209, 255, 0.85)"; // Cyan glow
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = "rgba(120, 209, 255, 0.5)";
+
+        ctx.beginPath();
+        const sliceWidth = width / bufferLength;
+        let x = 0;
+
+        for (let i = 0; i < bufferLength; i++) {
+          const v = dataArray[i] / 128.0;
+          const y = (v * height) / 2;
+
+          if (i === 0) {
+            ctx.moveTo(x, y);
+          } else {
+            ctx.lineTo(x, y);
+          }
+          x += sliceWidth;
+        }
+
+        ctx.lineTo(width, height / 2);
+        ctx.stroke();
+        ctx.shadowBlur = 0; // Reset
+
+      } else if (voiceState === 'speaking' && voiceSpeakerAnalyser) {
+        // Draw Speaker Oscilloscope Wave
+        const bufferLength = voiceSpeakerAnalyser.frequencyBinCount;
+        const dataArray = new Uint8Array(bufferLength);
+        voiceSpeakerAnalyser.getByteTimeDomainData(dataArray);
+
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = "rgba(126, 255, 55, 0.85)"; // Green glow
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = "rgba(126, 255, 55, 0.5)";
+
+        ctx.beginPath();
+        const sliceWidth = width / bufferLength;
+        let x = 0;
+
+        for (let i = 0; i < bufferLength; i++) {
+          const v = dataArray[i] / 128.0;
+          const y = (v * height) / 2;
+
+          if (i === 0) {
+            ctx.moveTo(x, y);
+          } else {
+            ctx.lineTo(x, y);
+          }
+          x += sliceWidth;
+        }
+
+        ctx.lineTo(width, height / 2);
+        ctx.stroke();
+        ctx.shadowBlur = 0; // Reset
+
+      } else if (voiceState === 'thinking') {
+        // Draw swirl orb
+        const centerX = width / 2;
+        const centerY = height / 2;
+        const time = Date.now() / 200;
+
+        ctx.shadowBlur = 20;
+        ctx.shadowColor = "rgba(181, 151, 255, 0.6)"; // Purple glow
+
+        for (let j = 0; j < 3; j++) {
+          ctx.beginPath();
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = `rgba(181, 151, 255, ${0.4 + j * 0.2})`;
+
+          const radius = 35 + j * 10 + Math.sin(time + j) * 4;
+          
+          for (let angle = 0; angle < Math.PI * 2; angle += 0.1) {
+            const rOffset = Math.sin(angle * 5 + time + j) * 3;
+            const x = centerX + (radius + rOffset) * Math.cos(angle);
+            const y = centerY + (radius + rOffset) * Math.sin(angle);
+            if (angle === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.closePath();
+          ctx.stroke();
+        }
+        ctx.shadowBlur = 0;
+
+      } else {
+        // Idle
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.15)";
+        ctx.beginPath();
+        ctx.moveTo(0, height / 2);
+        ctx.lineTo(width, height / 2);
+        ctx.stroke();
+
+        const centerX = width / 2;
+        const centerY = height / 2;
+        const breathing = 35 + Math.sin(Date.now() / 800) * 2;
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, breathing, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    renderVisualizerFrame();
+  }
 
   updateHeader();
   bindWelcomeChips();

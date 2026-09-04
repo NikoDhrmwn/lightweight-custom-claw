@@ -9,7 +9,7 @@ import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { createLogger } from '../logger.js';
-import { estimateTokens } from './context.js';
+import { estimateTokens, resolveContextThresholds } from './context.js';
 import type { TaskPlan } from './tasks.js';
 
 const log = createLogger('memory');
@@ -41,6 +41,25 @@ export interface SessionMetrics {
   estimatedTokens: number;
   imageCount: number;
   lastActivity: number | null;
+  maxContextTokens?: number;
+  budgetTokens?: number;
+  softThresholdTokens?: number;
+  usagePct?: number;
+  compactionThresholdPct?: number;
+  isNearCompaction?: boolean;
+}
+
+export interface ScheduledTask {
+  id: string;
+  sessionKey: string;
+  channelType: string;
+  channelTarget: string;
+  triggerAtMs: number;
+  taskType: 'reminder' | 'agent_prompt';
+  payload: string;
+  repeatIntervalMs?: number;
+  status: 'pending' | 'running' | 'completed' | 'cancelled' | 'failed';
+  createdAtMs: number;
 }
 
 export interface StoredTaskPlan {
@@ -53,12 +72,53 @@ export interface StoredTaskPlan {
   updatedAt: number;
 }
 
+export interface UsageStats {
+  days: number;
+  totalMessages: number;
+  totalSessions: number;
+  estimatedTokens: number;
+  userMessages: number;
+  assistantMessages: number;
+  topSessions: Array<{ sessionKey: string; messageCount: number; estimatedTokens: number }>;
+  dailyActivity: Array<{ date: string; messages: number; estimatedTokens: number }>;
+}
+
+export interface KanbanBoard {
+  id: string;
+  userKey: string;
+  name: string;
+  createdAt: number;
+}
+
+export interface KanbanCard {
+  id: string;
+  boardId: string;
+  columnName: string;
+  title: string;
+  description?: string;
+  priority: 'low' | 'medium' | 'high' | 'urgent';
+  dueDate?: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface SkillUsageStat {
+  skillName: string;
+  count: number;
+  lastUsed: number;
+}
+
 // ─── Memory Store ────────────────────────────────────────────────────
+
+let defaultMemoryStore: MemoryStore | null = null;
 
 export class MemoryStore {
   private db: Database.Database;
 
   constructor(dbPath?: string) {
+    if (!defaultMemoryStore) {
+      defaultMemoryStore = this;
+    }
     const dataDir = process.env.LITECLAW_STATE_DIR ??
       join(process.env.USERPROFILE ?? process.env.HOME ?? '.', '.liteclaw');
 
@@ -118,7 +178,90 @@ export class MemoryStore {
 
       CREATE INDEX IF NOT EXISTS idx_task_plans_session
         ON task_plans(session_key, updated_at_ms DESC);
+
+      CREATE TABLE IF NOT EXISTS scheduled_tasks (
+        id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL,
+        channel_type TEXT NOT NULL,
+        channel_target TEXT NOT NULL,
+        trigger_at_ms INTEGER NOT NULL,
+        task_type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        repeat_interval_ms INTEGER DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at_ms INTEGER NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_trigger
+        ON scheduled_tasks(status, trigger_at_ms);
+
+      -- FTS5 full text search for cross-session recall
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        content,
+        role,
+        session_key UNINDEXED,
+        content_rowid UNINDEXED
+      );
+
+      -- Kanban Board Schema
+      CREATE TABLE IF NOT EXISTS kanban_boards (
+        id TEXT PRIMARY KEY,
+        user_key TEXT NOT NULL,
+        name TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS kanban_cards (
+        id TEXT PRIMARY KEY,
+        board_id TEXT NOT NULL,
+        column_name TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        priority TEXT DEFAULT 'medium',
+        due_date TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_kanban_cards_board
+        ON kanban_cards(board_id, column_name);
+
+      -- Skill Usage Tracking
+      CREATE TABLE IF NOT EXISTS skill_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        skill_name TEXT NOT NULL,
+        session_key TEXT NOT NULL,
+        query TEXT,
+        timestamp INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_skill_usage_name
+        ON skill_usage(skill_name, timestamp DESC);
     `);
+
+    // FTS sync triggers
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_messages_fts_insert AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(content, role, session_key, content_rowid)
+        VALUES (new.content, new.role, new.session_key, new.id);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_messages_fts_delete AFTER DELETE ON messages BEGIN
+        DELETE FROM messages_fts WHERE content_rowid = old.id;
+      END;
+    `);
+
+    // FTS backfill if needed
+    try {
+      const ftsCount = (this.db.prepare('SELECT count(*) as c FROM messages_fts').get() as any)?.c ?? 0;
+      if (ftsCount === 0) {
+        this.db.exec(`
+          INSERT INTO messages_fts(content, role, session_key, content_rowid)
+          SELECT content, role, session_key, id FROM messages;
+        `);
+      }
+    } catch {}
 
     // ─── Migrations ──────────────────────────────────────────────
     try {
@@ -173,6 +316,47 @@ export class MemoryStore {
       LIMIT ?
     `);
     return stmt.all(`%${query}%`, limit) as MemoryEntry[];
+  }
+
+  /**
+   * High-speed FTS5 full-text search with relevance ranking.
+   */
+  searchFTS(query: string, limit: number = 10, sessionKey?: string): MemoryEntry[] {
+    const cleaned = query.replace(/["*]/g, '').trim();
+    if (!cleaned) return [];
+    const ftsQuery = cleaned
+      .split(/\s+/)
+      .filter(w => w.length > 0)
+      .map(w => `"${w.replace(/"/g, '""')}"*`)
+      .join(' ');
+
+    if (!ftsQuery) return [];
+
+    try {
+      if (sessionKey) {
+        const stmt = this.db.prepare(`
+          SELECT m.id, m.session_key as sessionKey, m.role, m.content, m.reasoning_content as reasoningContent, m.timestamp, m.metadata
+          FROM messages_fts f
+          JOIN messages m ON m.id = f.content_rowid
+          WHERE messages_fts MATCH ? AND f.session_key = ?
+          ORDER BY rank
+          LIMIT ?
+        `);
+        return stmt.all(ftsQuery, sessionKey, limit) as MemoryEntry[];
+      } else {
+        const stmt = this.db.prepare(`
+          SELECT m.id, m.session_key as sessionKey, m.role, m.content, m.reasoning_content as reasoningContent, m.timestamp, m.metadata
+          FROM messages_fts f
+          JOIN messages m ON m.id = f.content_rowid
+          WHERE messages_fts MATCH ?
+          ORDER BY rank
+          LIMIT ?
+        `);
+        return stmt.all(ftsQuery, limit) as MemoryEntry[];
+      }
+    } catch {
+      return this.search(query, limit);
+    }
   }
 
   /**
@@ -332,13 +516,190 @@ export class MemoryStore {
       }
     }
 
+    const thresholds = resolveContextThresholds();
+    const usagePct = thresholds.budgetTokens > 0
+      ? Math.round((estimatedTokens / thresholds.budgetTokens) * 100)
+      : 0;
+    const isNearCompaction = estimatedTokens >= thresholds.softThresholdTokens;
+
     return {
       sessionKey,
       messageCount: summary?.messageCount ?? 0,
       estimatedTokens,
       imageCount,
       lastActivity: summary?.lastActivity ?? null,
+      maxContextTokens: thresholds.maxContextTokens,
+      budgetTokens: thresholds.budgetTokens,
+      softThresholdTokens: thresholds.softThresholdTokens,
+      usagePct,
+      compactionThresholdPct: thresholds.compactionPct,
+      isNearCompaction,
     };
+  }
+
+  // ─── Scheduled Tasks ───────────────────────────────────────────────
+
+  createScheduledTask(task: {
+    id?: string;
+    sessionKey: string;
+    channelType: string;
+    channelTarget: string;
+    triggerAtMs: number;
+    taskType: 'reminder' | 'agent_prompt';
+    payload: string;
+    repeatIntervalMs?: number;
+  }): ScheduledTask {
+    const id = task.id || `task_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const createdAtMs = Date.now();
+    const status = 'pending';
+    const repeatIntervalMs = task.repeatIntervalMs || 0;
+
+    const stmt = this.db.prepare(`
+      INSERT INTO scheduled_tasks (
+        id, session_key, channel_type, channel_target,
+        trigger_at_ms, task_type, payload, repeat_interval_ms, status, created_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    stmt.run(
+      id,
+      task.sessionKey,
+      task.channelType,
+      task.channelTarget,
+      task.triggerAtMs,
+      task.taskType,
+      task.payload,
+      repeatIntervalMs,
+      status,
+      createdAtMs
+    );
+
+    return {
+      id,
+      sessionKey: task.sessionKey,
+      channelType: task.channelType,
+      channelTarget: task.channelTarget,
+      triggerAtMs: task.triggerAtMs,
+      taskType: task.taskType,
+      payload: task.payload,
+      repeatIntervalMs,
+      status,
+      createdAtMs,
+    };
+  }
+
+  getDueScheduledTasks(nowMs: number = Date.now()): ScheduledTask[] {
+    const stmt = this.db.prepare(`
+      SELECT
+        id,
+        session_key as sessionKey,
+        channel_type as channelType,
+        channel_target as channelTarget,
+        trigger_at_ms as triggerAtMs,
+        task_type as taskType,
+        payload,
+        repeat_interval_ms as repeatIntervalMs,
+        status,
+        created_at_ms as createdAtMs
+      FROM scheduled_tasks
+      WHERE status = 'pending' AND trigger_at_ms <= ?
+      ORDER BY trigger_at_ms ASC
+    `);
+
+    return stmt.all(nowMs) as ScheduledTask[];
+  }
+
+  getScheduledTask(id: string): ScheduledTask | null {
+    const stmt = this.db.prepare(`
+      SELECT
+        id,
+        session_key as sessionKey,
+        channel_type as channelType,
+        channel_target as channelTarget,
+        trigger_at_ms as triggerAtMs,
+        task_type as taskType,
+        payload,
+        repeat_interval_ms as repeatIntervalMs,
+        status,
+        created_at_ms as createdAtMs
+      FROM scheduled_tasks
+      WHERE id = ?
+    `);
+
+    const row = stmt.get(id) as ScheduledTask | undefined;
+    return row ?? null;
+  }
+
+  updateScheduledTaskStatus(id: string, status: ScheduledTask['status']): void {
+    const stmt = this.db.prepare(`
+      UPDATE scheduled_tasks
+      SET status = ?
+      WHERE id = ?
+    `);
+    stmt.run(status, id);
+  }
+
+  rescheduleTask(id: string, nextTriggerAtMs: number): void {
+    const stmt = this.db.prepare(`
+      UPDATE scheduled_tasks
+      SET trigger_at_ms = ?, status = 'pending'
+      WHERE id = ?
+    `);
+    stmt.run(nextTriggerAtMs, id);
+  }
+
+  listScheduledTasks(filter?: { sessionKey?: string; status?: string; limit?: number }): ScheduledTask[] {
+    let sql = `
+      SELECT
+        id,
+        session_key as sessionKey,
+        channel_type as channelType,
+        channel_target as channelTarget,
+        trigger_at_ms as triggerAtMs,
+        task_type as taskType,
+        payload,
+        repeat_interval_ms as repeatIntervalMs,
+        status,
+        created_at_ms as createdAtMs
+      FROM scheduled_tasks
+    `;
+
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (filter?.sessionKey) {
+      conditions.push('session_key = ?');
+      params.push(filter.sessionKey);
+    }
+
+    if (filter?.status) {
+      conditions.push('status = ?');
+      params.push(filter.status);
+    }
+
+    if (conditions.length > 0) {
+      sql += ` WHERE ${conditions.join(' AND ')}`;
+    }
+
+    sql += ` ORDER BY trigger_at_ms ASC`;
+
+    if (filter?.limit) {
+      sql += ` LIMIT ?`;
+      params.push(filter.limit);
+    }
+
+    const stmt = this.db.prepare(sql);
+    return stmt.all(...params) as ScheduledTask[];
+  }
+
+  cancelScheduledTask(id: string): boolean {
+    const stmt = this.db.prepare(`
+      UPDATE scheduled_tasks
+      SET status = 'cancelled'
+      WHERE id = ? AND status = 'pending'
+    `);
+    const result = stmt.run(id);
+    return result.changes > 0;
   }
 
   /**
@@ -383,7 +744,200 @@ export class MemoryStore {
     return result.changes;
   }
 
+  /**
+   * Get the most recent message sent by the user for this session.
+   */
+  getLastUserMessage(sessionKey: string): MemoryEntry | null {
+    const row = this.db.prepare(`
+      SELECT id, session_key as sessionKey, role, content, reasoning_content as reasoningContent, timestamp, metadata
+      FROM messages
+      WHERE session_key = ? AND role = 'user'
+      ORDER BY timestamp DESC
+      LIMIT 1
+    `).get(sessionKey) as MemoryEntry | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * Revert the last full exchange (last user turn and subsequent assistant messages).
+   */
+  undoLastExchange(sessionKey: string): { removedCount: number; undoneUserMessage?: string } {
+    const lastUser = this.getLastUserMessage(sessionKey);
+    if (!lastUser || !lastUser.timestamp) {
+      return { removedCount: 0 };
+    }
+    const res = this.db.prepare(`
+      DELETE FROM messages
+      WHERE session_key = ? AND timestamp >= ?
+    `).run(sessionKey, lastUser.timestamp);
+    this.db.prepare('DELETE FROM task_plans WHERE session_key = ?').run(sessionKey);
+    return {
+      removedCount: res.changes,
+      undoneUserMessage: lastUser.content,
+    };
+  }
+
+  /**
+   * Gather aggregated usage analytics over the past N days.
+   */
+  getUsageStats(days: number = 7): UsageStats {
+    const sinceMs = Date.now() - (days * 24 * 60 * 60 * 1000);
+    const totalRow = this.db.prepare(`
+      SELECT 
+        COUNT(*) as totalMessages,
+        COUNT(DISTINCT session_key) as totalSessions,
+        SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END) as userMessages,
+        SUM(CASE WHEN role = 'assistant' THEN 1 ELSE 0 END) as assistantMessages
+      FROM messages
+      WHERE timestamp >= ?
+    `).get(sinceMs) as any;
+
+    const topSessionsRows = this.db.prepare(`
+      SELECT 
+        session_key as sessionKey,
+        COUNT(*) as messageCount,
+        SUM(LENGTH(content) / 4) as estimatedTokens
+      FROM messages
+      WHERE timestamp >= ?
+      GROUP BY session_key
+      ORDER BY messageCount DESC
+      LIMIT 5
+    `).all(sinceMs) as Array<{ sessionKey: string; messageCount: number; estimatedTokens: number }>;
+
+    const dailyRows = this.db.prepare(`
+      SELECT 
+        DATE(created_at) as date,
+        COUNT(*) as messages,
+        SUM(LENGTH(content) / 4) as estimatedTokens
+      FROM messages
+      WHERE timestamp >= ?
+      GROUP BY DATE(created_at)
+      ORDER BY date ASC
+    `).all(sinceMs) as Array<{ date: string; messages: number; estimatedTokens: number }>;
+
+    const totalEstimatedTokens = this.db.prepare(`
+      SELECT SUM(LENGTH(content) / 4) as tokens
+      FROM messages
+      WHERE timestamp >= ?
+    `).get(sinceMs) as any;
+
+    return {
+      days,
+      totalMessages: totalRow?.totalMessages ?? 0,
+      totalSessions: totalRow?.totalSessions ?? 0,
+      estimatedTokens: Math.round(totalEstimatedTokens?.tokens ?? 0),
+      userMessages: totalRow?.userMessages ?? 0,
+      assistantMessages: totalRow?.assistantMessages ?? 0,
+      topSessions: topSessionsRows.map(s => ({ ...s, estimatedTokens: Math.round(s.estimatedTokens) })),
+      dailyActivity: dailyRows.map(d => ({ ...d, estimatedTokens: Math.round(d.estimatedTokens) })),
+    };
+  }
+
+  // ─── Kanban Board Operations ────────────────────────────────────────
+
+  createKanbanBoard(userKey: string, name: string): KanbanBoard {
+    const id = `board_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO kanban_boards (id, user_key, name, created_at_ms)
+      VALUES (?, ?, ?, ?)
+    `).run(id, userKey, name, now);
+    return { id, userKey, name, createdAt: now };
+  }
+
+  listKanbanBoards(userKey: string): KanbanBoard[] {
+    const rows = this.db.prepare(`
+      SELECT id, user_key as userKey, name, created_at_ms as createdAt
+      FROM kanban_boards
+      WHERE user_key = ?
+      ORDER BY created_at_ms DESC
+    `).all(userKey) as KanbanBoard[];
+    return rows;
+  }
+
+  addKanbanCard(
+    boardId: string,
+    title: string,
+    description: string = '',
+    columnName: string = 'todo',
+    priority: KanbanCard['priority'] = 'medium',
+    dueDate?: string
+  ): KanbanCard {
+    const id = `card_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const now = Date.now();
+    this.db.prepare(`
+      INSERT INTO kanban_cards (id, board_id, column_name, title, description, priority, due_date, created_at_ms, updated_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, boardId, columnName, title, description, priority, dueDate ?? null, now, now);
+    return {
+      id,
+      boardId,
+      columnName,
+      title,
+      description,
+      priority,
+      dueDate,
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  moveKanbanCard(cardId: string, targetColumn: string): boolean {
+    const res = this.db.prepare(`
+      UPDATE kanban_cards
+      SET column_name = ?, updated_at_ms = ?
+      WHERE id = ?
+    `).run(targetColumn, Date.now(), cardId);
+    return res.changes > 0;
+  }
+
+  listKanbanCards(boardId: string): KanbanCard[] {
+    const rows = this.db.prepare(`
+      SELECT 
+        id, board_id as boardId, column_name as columnName,
+        title, description, priority, due_date as dueDate,
+        created_at_ms as createdAt, updated_at_ms as updatedAt
+      FROM kanban_cards
+      WHERE board_id = ?
+      ORDER BY updated_at_ms DESC
+    `).all(boardId) as KanbanCard[];
+    return rows;
+  }
+
+  deleteKanbanCard(cardId: string): boolean {
+    const res = this.db.prepare('DELETE FROM kanban_cards WHERE id = ?').run(cardId);
+    return res.changes > 0;
+  }
+
+  // ─── Skill Usage Tracking ──────────────────────────────────────────
+
+  recordSkillUsage(skillName: string, sessionKey: string, query?: string): void {
+    this.db.prepare(`
+      INSERT INTO skill_usage (skill_name, session_key, query, timestamp)
+      VALUES (?, ?, ?, ?)
+    `).run(skillName, sessionKey, query ?? null, Date.now());
+  }
+
+  getTopSkills(limit: number = 10): SkillUsageStat[] {
+    const rows = this.db.prepare(`
+      SELECT skill_name as skillName, COUNT(*) as count, MAX(timestamp) as lastUsed
+      FROM skill_usage
+      GROUP BY skill_name
+      ORDER BY count DESC
+      LIMIT ?
+    `).all(limit) as SkillUsageStat[];
+    return rows;
+  }
+
   close(): void {
     this.db.close();
   }
 }
+
+export function getMemoryStore(dbPath?: string): MemoryStore {
+  if (!defaultMemoryStore) {
+    defaultMemoryStore = new MemoryStore(dbPath);
+  }
+  return defaultMemoryStore;
+}
+

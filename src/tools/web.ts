@@ -3,6 +3,12 @@
  *
  * Free multi-backend web search with optional Google Grounding.
  * Default path uses zero-cost public search endpoints / HTML results.
+ *
+ * Fallback chain (in order):
+ *   1. SearXNG instances (configured or defaults)
+ *   2. Tavily API        (if TAVILY_API_KEY or tools.web.search.tavilyApiKey set)
+ *   3. DuckDuckGo Lite   (last resort — often blocked, kept as best-effort)
+ *   4. DuckDuckGo HTML   (last resort — often blocked, kept as best-effort)
  */
 
 import { createHash } from 'crypto';
@@ -19,11 +25,11 @@ const DEFAULT_SEARXNG_INSTANCES = [
   'https://northboot.xyz',
 ];
 
-// ─── web_search (Google Grounding) ───────────────────────────────────
+// ─── web_search ───────────────────────────────────────────────────────
 
 toolRegistry.register({
   name: 'web_search',
-  description: 'Search the web and return source-rich results. Uses free backends by default, with optional Google Grounding.',
+  description: 'Search the web and return source-rich results. Uses free backends by default (SearXNG → Tavily → DuckDuckGo), with optional Google Grounding. Configure TAVILY_API_KEY environment variable for reliable results.',
   category: 'web',
   parameters: [
     { name: 'query', type: 'string', description: 'The search query', required: true },
@@ -63,10 +69,10 @@ toolRegistry.register({
           output = await googleGroundingSearch(query, apiKey, maxResults);
         } catch (err: any) {
           console.warn('Google Grounding failed, falling back to free search:', err.message);
-          output = await freeWebSearch(query, maxResults, config.tools?.web?.search?.instances);
+          output = await freeWebSearch(query, maxResults, config.tools?.web?.search);
         }
       } else {
-        output = await freeWebSearch(query, maxResults, config.tools?.web?.search?.instances);
+        output = await freeWebSearch(query, maxResults, config.tools?.web?.search);
       }
 
       searchCache.set(cacheKey, {
@@ -143,10 +149,15 @@ async function googleGroundingSearch(query: string, apiKey: string, maxResults: 
   return resultText || 'No results found.';
 }
 
-async function freeWebSearch(query: string, maxResults: number, configuredInstances: unknown): Promise<string> {
+/**
+ * Main free-search orchestrator.
+ * Tries backends in order until one returns results.
+ */
+async function freeWebSearch(query: string, maxResults: number, searchConfig: any): Promise<string> {
   const errors: string[] = [];
-  const instances = normalizeSearxngInstances(configuredInstances);
 
+  // 1. SearXNG instances
+  const instances = normalizeSearxngInstances(searchConfig?.instances);
   for (const instance of instances) {
     try {
       const results = await searxngSearch(instance, query, maxResults);
@@ -159,6 +170,21 @@ async function freeWebSearch(query: string, maxResults: number, configuredInstan
     }
   }
 
+  // 2. Tavily API
+  const tavilyKey = searchConfig?.tavilyApiKey ?? process.env.TAVILY_API_KEY;
+  if (tavilyKey) {
+    try {
+      const tavilyResults = await tavilySearch(query, maxResults, tavilyKey);
+      if (tavilyResults.length > 0) {
+        return formatSearchResults('Tavily', query, tavilyResults);
+      }
+      errors.push('Tavily: empty results');
+    } catch (err: any) {
+      errors.push(`Tavily: ${err.message}`);
+    }
+  }
+
+  // 3. DuckDuckGo Lite (last resort)
   try {
     const liteResults = await duckDuckGoLiteSearch(query, maxResults);
     if (liteResults.length > 0) {
@@ -169,6 +195,7 @@ async function freeWebSearch(query: string, maxResults: number, configuredInstan
     errors.push(`DuckDuckGo Lite: ${err.message}`);
   }
 
+  // 4. DuckDuckGo HTML (last resort)
   try {
     const htmlResults = await duckDuckGoHtmlSearch(query, maxResults);
     if (htmlResults.length > 0) {
@@ -188,6 +215,47 @@ type SearchHit = {
   snippet?: string;
   source?: string;
 };
+
+// ─── Tavily API ───────────────────────────────────────────────────────
+
+async function tavilySearch(query: string, maxResults: number, apiKey: string): Promise<SearchHit[]> {
+  const response = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      query,
+      max_results: Math.min(maxResults * 2, 10),
+      include_answer: false,
+      search_depth: 'basic',
+    }),
+    signal: AbortSignal.timeout(DEFAULT_SEARCH_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`Tavily API HTTP ${response.status}${body ? `: ${body.slice(0, 200)}` : ''}`);
+  }
+
+  const data = await response.json() as any;
+  const results = Array.isArray(data.results) ? data.results : [];
+
+  return dedupeSearchHits(
+    results
+      .slice(0, maxResults * 2)
+      .map((r: any): SearchHit => ({
+        title: String(r.title ?? '').trim(),
+        url: String(r.url ?? '').trim(),
+        snippet: String(r.content ?? r.description ?? '').slice(0, 400).trim() || undefined,
+        source: 'tavily',
+      }))
+      .filter((r: SearchHit) => r.title && r.url)
+  ).slice(0, maxResults);
+}
+
+// ─── SearXNG ──────────────────────────────────────────────────────────
 
 async function searxngSearch(instance: string, query: string, maxResults: number): Promise<SearchHit[]> {
   const base = instance.replace(/\/+$/, '');
@@ -222,23 +290,47 @@ async function searxngSearch(instance: string, query: string, maxResults: number
     .slice(0, maxResults);
 }
 
+// ─── DuckDuckGo (last-resort, often blocked) ──────────────────────────
+
+/** Browser-like headers to reduce bot-detection odds */
+const DDG_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.5',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Content-Type': 'application/x-www-form-urlencoded',
+  'Origin': 'https://lite.duckduckgo.com',
+  'Referer': 'https://lite.duckduckgo.com/',
+  'DNT': '1',
+  'Connection': 'keep-alive',
+  'Upgrade-Insecure-Requests': '1',
+};
+
 async function duckDuckGoLiteSearch(query: string, maxResults: number): Promise<SearchHit[]> {
   const response = await fetch('https://lite.duckduckgo.com/lite/', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'LiteClaw/0.1',
-    },
+    headers: DDG_HEADERS,
     body: new URLSearchParams({ q: query }).toString(),
     signal: AbortSignal.timeout(DEFAULT_SEARCH_TIMEOUT_MS),
     redirect: 'follow',
   });
+
+  // DDG often returns 202 when it wants JS verification — treat as failure
+  if (response.status === 202) {
+    throw new Error('DuckDuckGo returned 202 (bot challenge — blocked)');
+  }
 
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
   }
 
   const html = await response.text();
+
+  // If response is a challenge page, bail out early
+  if (html.includes('https://duckduckgo.com/cdn-cgi/') || html.includes('cf-challenge')) {
+    throw new Error('DuckDuckGo returned a bot-challenge page');
+  }
+
   const hits = parseDuckDuckGoLiteResults(html);
   return dedupeSearchHits(hits).slice(0, maxResults);
 }
@@ -247,39 +339,62 @@ async function duckDuckGoHtmlSearch(query: string, maxResults: number): Promise<
   const response = await fetch('https://html.duckduckgo.com/html/', {
     method: 'POST',
     headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'LiteClaw/0.1',
+      ...DDG_HEADERS,
+      'Origin': 'https://html.duckduckgo.com',
+      'Referer': 'https://html.duckduckgo.com/',
     },
     body: new URLSearchParams({ q: query }).toString(),
     signal: AbortSignal.timeout(DEFAULT_SEARCH_TIMEOUT_MS),
     redirect: 'follow',
   });
 
+  if (response.status === 202) {
+    throw new Error('DuckDuckGo returned 202 (bot challenge — blocked)');
+  }
+
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
   }
 
   const html = await response.text();
+
+  if (html.includes('https://duckduckgo.com/cdn-cgi/') || html.includes('cf-challenge')) {
+    throw new Error('DuckDuckGo returned a bot-challenge page');
+  }
+
   const hits = parseDuckDuckGoHtmlResults(html);
   return dedupeSearchHits(hits).slice(0, maxResults);
 }
 
 function parseDuckDuckGoLiteResults(html: string): SearchHit[] {
   const hits: SearchHit[] = [];
-  const rowRegex = /<a[^>]*href="([^"]+)"[^>]*class=['"][^'"]*result-link[^'"]*['"][^>]*>([\s\S]*?)<\/a>([\s\S]*?)(?=<a[^>]*class=['"][^'"]*result-link|<\/table>|$)/gi;
 
-  let match: RegExpExecArray | null;
-  while ((match = rowRegex.exec(html)) !== null) {
-    const rawUrl = decodeHtmlEntities(match[1]);
+  // DDG Lite uses a simple table structure. Each result is a <tr> with class "result-sponsored" or an anchor with class "result-link"
+  // Strategy: find all anchors with class "result-link"
+  const linkRegex = /<a[^>]+class="[^"]*result-link[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const snippetRegex = /<td[^>]+class="[^"]*result-snippet[^"]*"[^>]*>([\s\S]*?)<\/td>/gi;
+
+  const links: Array<{ url: string; title: string }> = [];
+  let m: RegExpExecArray | null;
+
+  while ((m = linkRegex.exec(html)) !== null) {
+    const rawUrl = decodeHtmlEntities(m[1]);
     if (isDuckDuckGoAdUrl(rawUrl)) continue;
     const url = normalizeSearchResultUrl(rawUrl);
-    const title = decodeHtmlEntities(stripHtml(match[2]));
-    if (/^more info$/i.test(title)) continue;
-    const tail = decodeHtmlEntities(stripHtml(match[3])).replace(/\s+/g, ' ').trim();
-    const snippet = tail || undefined;
+    const title = decodeHtmlEntities(stripHtml(m[2])).trim();
+    if (!title || /^more info$/i.test(title)) continue;
+    links.push({ url, title });
+  }
 
+  const snippets: string[] = [];
+  while ((m = snippetRegex.exec(html)) !== null) {
+    snippets.push(decodeHtmlEntities(stripHtml(m[1])).replace(/\s+/g, ' ').trim());
+  }
+
+  for (let i = 0; i < links.length; i++) {
+    const { url, title } = links[i];
     if (title && url) {
-      hits.push({ title, url, snippet, source: 'duckduckgo-lite' });
+      hits.push({ title, url, snippet: snippets[i] || undefined, source: 'duckduckgo-lite' });
     }
   }
 
@@ -288,21 +403,31 @@ function parseDuckDuckGoLiteResults(html: string): SearchHit[] {
 
 function parseDuckDuckGoHtmlResults(html: string): SearchHit[] {
   const hits: SearchHit[] = [];
-  const blockRegex = /<div class="result(?:__body)?">([\s\S]*?)<\/div>\s*<\/div>/gi;
+
+  // DDG HTML results are <div class="result ..."> blocks
+  // More permissive regex to handle different DDG HTML structures
+  const blockRegex = /<div[^>]+class="[^"]*result[^"]*"[^>]*>([\s\S]*?)(?=<div[^>]+class="[^"]*result[^"]*"|<div[^>]+id="links_wrapper"|$)/gi;
 
   let block: RegExpExecArray | null;
   while ((block = blockRegex.exec(html)) !== null) {
     const body = block[1];
-    const linkMatch = body.match(/<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
+
+    // Find the main result link — DDG uses class="result__a" or class="result__title-link"
+    const linkMatch = body.match(/<a[^>]+class="[^"]*result__(?:a|title-link)[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i)
+      ?? body.match(/<a[^>]+href="([^"]+)"[^>]+class="[^"]*result__(?:a|title-link)[^"]*"[^>]*>([\s\S]*?)<\/a>/i);
     if (!linkMatch) continue;
 
     if (isDuckDuckGoAdUrl(linkMatch[1])) continue;
     const title = decodeHtmlEntities(stripHtml(linkMatch[2])).trim();
-    if (/^more info$/i.test(title)) continue;
+    if (!title || /^more info$/i.test(title)) continue;
     const url = normalizeSearchResultUrl(decodeHtmlEntities(linkMatch[1]));
-    const snippetMatch = body.match(/<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>|<div[^>]*class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
-    const snippetRaw = snippetMatch?.[1] ?? snippetMatch?.[2] ?? '';
-    const snippet = decodeHtmlEntities(stripHtml(snippetRaw)).replace(/\s+/g, ' ').trim() || undefined;
+
+    // Snippet — try several class patterns DDG has used over the years
+    const snippetMatch = body.match(/<[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/[a-z]+>/i)
+      ?? body.match(/<span[^>]+class="[^"]*snippet[^"]*"[^>]*>([\s\S]*?)<\/span>/i);
+    const snippet = snippetMatch
+      ? decodeHtmlEntities(stripHtml(snippetMatch[1])).replace(/\s+/g, ' ').trim() || undefined
+      : undefined;
 
     if (title && url) {
       hits.push({ title, url, snippet, source: 'duckduckgo-html' });

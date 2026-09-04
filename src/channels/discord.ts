@@ -44,6 +44,7 @@ import { getConfig, getStateDir } from '../config.js';
 import { resolveContextThresholds } from '../core/context.js';
 import { createLogger } from '../logger.js';
 import { preprocessImage } from '../tools/vision.js';
+import { readMemoryFile } from '../core/personality_memory.js';
 import type { InteractiveChoiceRequest } from '../core/tools.js';
 import {
   applyEventToChannelProgress,
@@ -58,6 +59,7 @@ import {
 } from './progress.js';
 import { DND_SLASH_COMMANDS, DndDiscordController } from '../dnd/discord.js';
 import type { DndSessionDetails } from '../dnd/types.js';
+import { VoicePipeline } from '../voice/voice-pipeline.js';
 
 const log = createLogger('discord');
 
@@ -279,6 +281,44 @@ const SLASH_COMMANDS = [
           { name: 'private', value: 'private' },
           { name: 'public', value: 'public' },
         )),
+  new SlashCommandBuilder()
+    .setName('voice')
+    .setDescription('Manage real-time voice channel conversation')
+    .addSubcommand(sub =>
+      sub.setName('join')
+        .setDescription('Join your current voice channel'))
+    .addSubcommand(sub =>
+      sub.setName('leave')
+        .setDescription('Leave the voice channel')),
+  new SlashCommandBuilder()
+    .setName('retry')
+    .setDescription('Re-run the last conversation turn with a fresh attempt'),
+  new SlashCommandBuilder()
+    .setName('undo')
+    .setDescription('Revert the last user and assistant exchange'),
+  new SlashCommandBuilder()
+    .setName('stop')
+    .setDescription('Immediately stop the currently running agent task in this channel'),
+  new SlashCommandBuilder()
+    .setName('memory')
+    .setDescription('View persistent knowledge (MEMORY.md) and user profile (USER.md)'),
+  new SlashCommandBuilder()
+    .setName('search')
+    .setDescription('Search past conversation history using SQLite FTS5')
+    .addStringOption(opt =>
+      opt.setName('query')
+        .setDescription('Keywords to search for')
+        .setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('insights')
+    .setDescription('View usage analytics, token consumption, and active sessions')
+    .addIntegerOption(opt =>
+      opt.setName('days')
+        .setDescription('Number of days to analyze (default: 7)')
+        .setRequired(false)),
+  new SlashCommandBuilder()
+    .setName('tasks')
+    .setDescription('View active Kanban boards and cards'),
   ...DND_SLASH_COMMANDS,
 ];
 
@@ -290,6 +330,7 @@ export class DiscordChannel {
   private confirmations: ConfirmationManager;
   private dnd: DndDiscordController;
   private config: any;
+  private voicePipelines = new Map<string, VoicePipeline>();
   private statusTimer: ReturnType<typeof setInterval> | null = null;
   private currentState: keyof typeof STATUS_MESSAGES = 'idle';
   private activeRequests = 0;
@@ -314,6 +355,7 @@ export class DiscordChannel {
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.DirectMessages,
         GatewayIntentBits.GuildMessageReactions,
+        GatewayIntentBits.GuildVoiceStates,
       ],
       partials: [
         Partials.Channel,
@@ -619,6 +661,30 @@ export class DiscordChannel {
       case 'question':
         await this.handleQuestionCommand(interaction);
         break;
+      case 'voice':
+        await this.handleVoiceCommand(interaction);
+        break;
+      case 'retry':
+        await this.handleRetryCommand(interaction);
+        break;
+      case 'undo':
+        await this.handleUndoCommand(interaction);
+        break;
+      case 'stop':
+        await this.handleStopCommand(interaction);
+        break;
+      case 'memory':
+        await this.handleMemoryCommand(interaction);
+        break;
+      case 'search':
+        await this.handleSearchCommand(interaction);
+        break;
+      case 'insights':
+        await this.handleInsightsCommand(interaction);
+        break;
+      case 'tasks':
+        await this.handleTasksCommand(interaction);
+        break;
       default:
         await interaction.reply({ content: 'Unknown command.', ephemeral: true });
     }
@@ -918,6 +984,121 @@ export class DiscordChannel {
     await interaction.reply({ embeds: [embed] });
   }
 
+  private async handleRetryCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const sessionKey = `discord:${interaction.channelId}`;
+    const lastUser = this.engine.getMemory().getLastUserMessage(sessionKey);
+    if (!lastUser) {
+      await interaction.reply({ content: '⚠️ No previous turn found to retry.', ephemeral: true });
+      return;
+    }
+    this.engine.getMemory().undoLastExchange(sessionKey);
+    await interaction.reply({ content: `🔄 Retrying turn: "${lastUser.content.slice(0, 100)}..."` });
+
+    const req: AgentRequest = {
+      sessionKey,
+      message: lastUser.content,
+      channelType: 'discord',
+      channelTarget: interaction.channelId,
+    };
+    const channel = interaction.channel;
+    if (channel && 'send' in channel) {
+      let output = '';
+      for await (const event of this.engine.processRequest(req)) {
+        if (event.type === 'content' && event.content) {
+          output += event.content;
+        }
+      }
+      if (output.trim()) {
+        await (channel as any).send(output.trim());
+      }
+    }
+  }
+
+  private async handleUndoCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const sessionKey = `discord:${interaction.channelId}`;
+    const result = this.engine.getMemory().undoLastExchange(sessionKey);
+    if (result.removedCount === 0) {
+      await interaction.reply({ content: '⚠️ No previous exchange found to undo.', ephemeral: true });
+    } else {
+      const embed = new EmbedBuilder()
+        .setAuthor({ name: 'LiteClaw · Undo' })
+        .setColor(0x00897B)
+        .setDescription(`↩️ Undid last exchange (${result.removedCount} messages removed).\n\nPrevious user prompt:\n> ${result.undoneUserMessage?.slice(0, 150) ?? ''}`);
+      await interaction.reply({ embeds: [embed] });
+    }
+  }
+
+  private async handleStopCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const sessionKey = `discord:${interaction.channelId}`;
+    const stopped = this.engine.abortSession(sessionKey);
+    await interaction.reply({
+      content: stopped ? '⏹️ Successfully stopped the running agent task.' : 'ℹ️ No active task was running in this channel.',
+      ephemeral: true,
+    });
+  }
+
+  private async handleMemoryCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const mem = readMemoryFile('memory');
+    const usr = readMemoryFile('user');
+    const embed = new EmbedBuilder()
+      .setAuthor({ name: 'LiteClaw · Persistent Memory' })
+      .setColor(0x5E35B1)
+      .addFields(
+        { name: '👤 USER.md (User Profile)', value: usr.slice(0, 1000) || '(empty)' },
+        { name: '📝 MEMORY.md (Facts & Knowledge)', value: mem.slice(0, 1000) || '(empty)' }
+      );
+    await interaction.reply({ embeds: [embed] });
+  }
+
+  private async handleSearchCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const query = interaction.options.getString('query', true);
+    const matches = this.engine.getMemory().searchFTS(query, 5);
+    if (matches.length === 0) {
+      await interaction.reply({ content: `🔍 No past messages found matching "${query}".`, ephemeral: true });
+      return;
+    }
+    const embed = new EmbedBuilder()
+      .setAuthor({ name: `LiteClaw · History Search ("${query}")` })
+      .setColor(0x00897B)
+      .setDescription(
+        matches.map(m => `• **${m.role.toUpperCase()}** (${new Date(m.timestamp).toLocaleDateString()}):\n${m.content.slice(0, 150)}...`).join('\n\n')
+      );
+    await interaction.reply({ embeds: [embed] });
+  }
+
+  private async handleInsightsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const days = Math.max(1, Math.min(90, interaction.options.getInteger('days') ?? 7));
+    const stats = this.engine.getMemory().getUsageStats(days);
+    const topSess = stats.topSessions.map(s => `• \`${s.sessionKey.slice(0, 20)}\`: ${s.messageCount} msgs (~${s.estimatedTokens.toLocaleString()} tokens)`).join('\n');
+    const embed = new EmbedBuilder()
+      .setAuthor({ name: `LiteClaw · Insights (Last ${days} Days)` })
+      .setColor(0x3949AB)
+      .addFields(
+        { name: '💬 Total Messages', value: `${stats.totalMessages.toLocaleString()} (${stats.userMessages} user, ${stats.assistantMessages} bot)`, inline: true },
+        { name: '🔑 Active Sessions', value: `${stats.totalSessions}`, inline: true },
+        { name: '🪙 Estimated Tokens', value: `~${stats.estimatedTokens.toLocaleString()}`, inline: true },
+        { name: '🏆 Top Sessions', value: topSess || '(none)' }
+      );
+    await interaction.reply({ embeds: [embed] });
+  }
+
+  private async handleTasksCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const userKey = `discord:${interaction.user.id}`;
+    const boards = this.engine.getMemory().listKanbanBoards(userKey);
+    if (boards.length === 0) {
+      await interaction.reply({ content: '📋 No Kanban boards found for you. Ask the bot to "create a task board for X".', ephemeral: true });
+      return;
+    }
+    const board = boards[0];
+    const cards = this.engine.getMemory().listKanbanCards(board.id);
+    const formatted = cards.slice(0, 10).map(c => `• **[${c.columnName.toUpperCase()}]** ${c.title} ${c.priority ? `(${c.priority})` : ''}`).join('\n');
+    const embed = new EmbedBuilder()
+      .setAuthor({ name: `LiteClaw · Kanban: ${board.name}` })
+      .setColor(0xFF9800)
+      .setDescription(formatted || '(empty board)');
+    await interaction.reply({ embeds: [embed] });
+  }
+
   private async handleQuestionCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const dndDetails = this.dnd.getSessionForThread(interaction.channelId);
     if (!dndDetails) {
@@ -1054,6 +1235,101 @@ export class DiscordChannel {
       await flushProgress(true, `Error: ${err.message}`);
     } finally {
       this.endRequest();
+    }
+  }
+
+  private async handleVoiceCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const subcommand = interaction.options.getSubcommand();
+    const guild = interaction.guild;
+
+    if (!guild) {
+      await interaction.reply({
+        content: 'This command can only be used in a server.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (subcommand === 'join') {
+      const member = await guild.members.fetch(interaction.user.id);
+      const voiceChannel = member.voice.channel;
+
+      if (!voiceChannel) {
+        await interaction.reply({
+          content: 'You must be in a voice channel to use this command.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      await interaction.deferReply({ ephemeral: true });
+
+      try {
+        // Leave previous connection if exists in this guild
+        const existingPipeline = this.voicePipelines.get(guild.id);
+        if (existingPipeline) {
+          existingPipeline.stop();
+          this.voicePipelines.delete(guild.id);
+        }
+
+        // Join the channel
+        const { joinVoiceChannel } = await import('@discordjs/voice');
+        const connection = joinVoiceChannel({
+          channelId: voiceChannel.id,
+          guildId: guild.id,
+          adapterCreator: guild.voiceAdapterCreator as any,
+          selfDeaf: false, // Must be false to receive audio!
+          selfMute: false,
+        });
+
+        // Initialize voice pipeline
+        const pipeline = new VoicePipeline(connection, this.engine);
+        pipeline.start();
+
+        this.voicePipelines.set(guild.id, pipeline);
+
+        log.info({ guildId: guild.id, channelId: voiceChannel.id }, 'Joined voice channel');
+        await interaction.editReply({
+          content: `Joined voice channel **${voiceChannel.name}** and started listening. Speak naturally!`,
+        });
+      } catch (err: any) {
+        log.error({ error: err.message }, 'Failed to join voice channel');
+        await interaction.editReply({
+          content: `Failed to join voice channel: ${err.message}`,
+        });
+      }
+    } else if (subcommand === 'leave') {
+      const pipeline = this.voicePipelines.get(guild.id);
+      if (!pipeline) {
+        await interaction.reply({
+          content: 'I am not currently in any voice channel in this server.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      try {
+        pipeline.stop();
+        this.voicePipelines.delete(guild.id);
+        
+        // Find existing connection to destroy
+        const { getVoiceConnection } = await import('@discordjs/voice');
+        const connection = getVoiceConnection(guild.id);
+        if (connection) {
+          connection.destroy();
+        }
+
+        await interaction.reply({
+          content: 'Left the voice channel.',
+          ephemeral: true,
+        });
+      } catch (err: any) {
+        log.error({ error: err.message }, 'Failed to leave voice channel');
+        await interaction.reply({
+          content: `Failed to leave voice channel: ${err.message}`,
+          ephemeral: true,
+        });
+      }
     }
   }
 

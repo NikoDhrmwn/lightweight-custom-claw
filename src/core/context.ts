@@ -196,7 +196,7 @@ export class ContextManager {
     const summaryText = toSummarize
       .map(m => {
         const content = typeof m.content === 'string' ? m.content : '[multimodal content]';
-        return `${m.role}: ${content.slice(0, 200)}`;
+        return `${m.role}: ${content.slice(0, 200).toWellFormed()}`;
       })
       .join('\n');
 
