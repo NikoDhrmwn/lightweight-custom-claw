@@ -63,7 +63,9 @@ toolRegistry.register({
       const formatted = results.map(r => {
         const dateStr = new Date(r.timestamp).toLocaleString();
         const snippet = r.content.length > 300 ? `${r.content.slice(0, 300)}...` : r.content;
-        return `• [${dateStr}] [${r.role.toUpperCase()}] (Session: ${r.sessionKey}):\n  ${snippet.replace(/\n/g, '\n  ')}`;
+        const sess = memory.getSession(r.sessionKey);
+        const sessLabel = sess?.sessionName ? `${r.sessionKey} - "${sess.sessionName}"` : r.sessionKey;
+        return `• [${dateStr}] [${r.role.toUpperCase()}] (Session: ${sessLabel}):\n  ${snippet.replace(/\n/g, '\n  ')}`;
       }).join('\n\n');
 
       return {

@@ -107,6 +107,8 @@ export interface AgentRequest {
   images?: string[];
   attachments?: AgentAttachment[];
   sessionKey: string;
+  sessionName?: string;
+  isGroup?: boolean;
   disablePlanner?: boolean;
   disableReasoning?: boolean;
   channelType: 'webui' | 'discord' | 'whatsapp' | 'cli' | 'subagent';
@@ -314,6 +316,14 @@ export class AgentEngine extends EventEmitter {
   }
 
   saveMessageSilent(request: AgentRequest): void {
+    if (request.sessionName) {
+      this.memory.upsertSession(request.sessionKey, {
+        sessionName: request.sessionName,
+        channelType: request.channelType,
+        channelTarget: request.channelTarget,
+        isGroup: request.isGroup,
+      });
+    }
     this.memory.saveMessage({
       sessionKey: request.sessionKey,
       role: 'user',
@@ -553,6 +563,10 @@ export class AgentEngine extends EventEmitter {
     // Inject WebUI-specific formatting rules if the request is coming from the WebUI
     if (request.channelType === 'webui') {
       systemPrompt += `\n\n${WEBUI_FORMATTING_RULES}`;
+    } else if (request.channelType === 'discord') {
+      systemPrompt += `\n\n# Discord Tagging & Mentions\n- You can tag/mention users, roles, or channels when relevant.\n- To mention a user: write @Username or @DisplayName (e.g. @Alice) or <@userId>.\n- To mention a role: write @RoleName.\n- To mention a channel: write #channel-name.\n- The system will automatically resolve recognized @mentions into active Discord pings.`;
+    } else if (request.channelType === 'whatsapp') {
+      systemPrompt += `\n\n# WhatsApp Tagging & Mentions\n- In group chats, you can tag/mention participants by writing @Name or @phoneNumber (e.g. @Alice or @628123456789).\n- The system will automatically resolve recognized @mentions into active WhatsApp pings.`;
     }
 
     const mcpInstructions = mcpManager.getPromptAppendix();
@@ -618,6 +632,15 @@ export class AgentEngine extends EventEmitter {
     }
 
     history.push(userMessage);
+
+    if (request.sessionName) {
+      this.memory.upsertSession(request.sessionKey, {
+        sessionName: request.sessionName,
+        channelType: request.channelType,
+        channelTarget: request.channelTarget,
+        isGroup: request.isGroup,
+      });
+    }
 
     this.memory.saveMessage({
       sessionKey: request.sessionKey,
@@ -1555,6 +1578,9 @@ Do not expose the internal plan outside tags.`;
 function buildRequestMetadata(request: AgentRequest): string | undefined {
   const metadata: Record<string, unknown> = {};
   if (request.userIdentifier) metadata.userIdentifier = request.userIdentifier;
+  if (request.sessionName) metadata.sessionName = request.sessionName;
+  if (request.isGroup !== undefined) metadata.isGroup = request.isGroup;
+  if (request.channelType) metadata.channelType = request.channelType;
   if (request.images?.length) metadata.imageCount = request.images.length;
   if (request.attachments?.length) metadata.attachments = request.attachments;
   return Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : undefined;

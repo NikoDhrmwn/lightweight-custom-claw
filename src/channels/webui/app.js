@@ -285,8 +285,15 @@
   }
 
   function formatSessionName(sessionOrKey) {
-    const key = typeof sessionOrKey === "string" ? sessionOrKey : sessionOrKey.sessionKey;
-    const identifier = typeof sessionOrKey === "string" ? "" : sessionOrKey.userIdentifier || "";
+    if (sessionOrKey && typeof sessionOrKey === "object" && sessionOrKey.sessionName) {
+      return sessionOrKey.sessionName;
+    }
+    const key = typeof sessionOrKey === "string" ? sessionOrKey : (sessionOrKey?.sessionKey || "");
+    const matching = sessions.find(s => s.sessionKey === key);
+    if (matching?.sessionName) {
+      return matching.sessionName;
+    }
+    const identifier = typeof sessionOrKey === "string" ? "" : sessionOrKey?.userIdentifier || "";
     if (key.startsWith("discord:")) return `Discord / ${identifier || key.slice(8)}`;
     if (key.startsWith("whatsapp:")) return `WhatsApp / ${identifier || key.slice(9)}`;
     if (key.startsWith("cli:")) return `CLI / ${key.slice(4)}`;

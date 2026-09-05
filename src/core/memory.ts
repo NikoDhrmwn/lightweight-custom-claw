@@ -28,6 +28,9 @@ export interface MemoryEntry {
 
 export interface SessionInfo {
   sessionKey: string;
+  sessionName?: string;
+  channelType?: string;
+  isGroup?: boolean;
   messageCount: number;
   lastActivity: number;
   firstActivity: number;
@@ -238,6 +241,20 @@ export class MemoryStore {
 
       CREATE INDEX IF NOT EXISTS idx_skill_usage_name
         ON skill_usage(skill_name, timestamp DESC);
+
+      -- Sessions Metadata Table
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_key TEXT PRIMARY KEY,
+        session_name TEXT NOT NULL,
+        channel_type TEXT,
+        channel_target TEXT,
+        is_group INTEGER DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_sessions_updated
+        ON sessions(updated_at DESC);
     `);
 
     // FTS sync triggers
@@ -445,31 +462,99 @@ export class MemoryStore {
   }
 
   /**
-   * List all sessions.
+   * Upsert a session record with a human-readable name (e.g. group name or server > channel).
+   */
+  upsertSession(sessionKey: string, data: {
+    sessionName: string;
+    channelType?: string;
+    channelTarget?: string;
+    isGroup?: boolean;
+  }): void {
+    const now = Date.now();
+    const isGroupInt = data.isGroup ? 1 : 0;
+    const stmt = this.db.prepare(`
+      INSERT INTO sessions (session_key, session_name, channel_type, channel_target, is_group, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_key) DO UPDATE SET
+        session_name = excluded.session_name,
+        channel_type = COALESCE(excluded.channel_type, sessions.channel_type),
+        channel_target = COALESCE(excluded.channel_target, sessions.channel_target),
+        is_group = excluded.is_group,
+        updated_at = excluded.updated_at
+    `);
+    stmt.run(
+      sessionKey,
+      data.sessionName,
+      data.channelType ?? null,
+      data.channelTarget ?? null,
+      isGroupInt,
+      now,
+      now
+    );
+  }
+
+  /**
+   * Get a session record by its key.
+   */
+  getSession(sessionKey: string): { sessionKey: string; sessionName: string; channelType?: string; isGroup: boolean } | null {
+    const stmt = this.db.prepare(`
+      SELECT session_key as sessionKey, session_name as sessionName, channel_type as channelType, is_group as isGroup
+      FROM sessions
+      WHERE session_key = ?
+    `);
+    const row = stmt.get(sessionKey) as any;
+    if (!row) return null;
+    return {
+      sessionKey: row.sessionKey,
+      sessionName: row.sessionName,
+      channelType: row.channelType,
+      isGroup: Boolean(row.isGroup),
+    };
+  }
+
+  /**
+   * List all sessions with their human-readable sessionName.
    */
   listSessions(): SessionInfo[] {
     const stmt = this.db.prepare(`
       SELECT
         m.session_key as sessionKey,
+        s.session_name as sessionName,
+        s.channel_type as channelType,
+        s.is_group as isGroup,
         COUNT(*) as messageCount,
         MAX(m.timestamp) as lastActivity,
         MIN(m.timestamp) as firstActivity,
         (SELECT metadata FROM messages m2 WHERE m2.session_key = m.session_key ORDER BY timestamp DESC LIMIT 1) as latestMetadata
       FROM messages m
+      LEFT JOIN sessions s ON s.session_key = m.session_key
       GROUP BY m.session_key
       ORDER BY lastActivity DESC
     `);
     const rows = stmt.all() as any[];
     return rows.map(r => {
-      let identifier = undefined;
+      let identifier: string | undefined = undefined;
+      let metaSessionName: string | undefined = undefined;
+      let metaIsGroup: boolean | undefined = undefined;
+      let metaChannelType: string | undefined = undefined;
       if (r.latestMetadata) {
         try {
           const meta = JSON.parse(r.latestMetadata);
           identifier = meta.userIdentifier;
+          metaSessionName = meta.sessionName;
+          metaIsGroup = meta.isGroup;
+          metaChannelType = meta.channelType;
         } catch(e) {}
       }
+
+      // Priority: sessions table name > message metadata name > clean fallback
+      const resolvedName = r.sessionName || metaSessionName || formatFallbackSessionName(r.sessionKey, identifier);
+
       return {
         sessionKey: r.sessionKey,
+        sessionName: resolvedName,
+        channelType: r.channelType || metaChannelType,
+        isGroup: r.isGroup !== null && r.isGroup !== undefined ? Boolean(r.isGroup) : metaIsGroup,
         messageCount: r.messageCount,
         lastActivity: r.lastActivity,
         firstActivity: r.firstActivity,
@@ -724,6 +809,7 @@ export class MemoryStore {
     this.db.prepare('DELETE FROM messages WHERE session_key = ?').run(sessionKey);
     this.db.prepare('DELETE FROM summaries WHERE session_key = ?').run(sessionKey);
     this.db.prepare('DELETE FROM task_plans WHERE session_key = ?').run(sessionKey);
+    this.db.prepare('DELETE FROM sessions WHERE session_key = ?').run(sessionKey);
   }
 
   /**
@@ -939,5 +1025,38 @@ export function getMemoryStore(dbPath?: string): MemoryStore {
     defaultMemoryStore = new MemoryStore(dbPath);
   }
   return defaultMemoryStore;
+}
+
+/**
+ * Clean fallback formatter for session names when not explicitly set.
+ */
+export function formatFallbackSessionName(sessionKey: string, userIdentifier?: string): string {
+  if (!sessionKey) return 'Session';
+  const parts = sessionKey.split(':');
+  const channel = parts[0];
+  const target = parts.slice(1).join(':');
+
+  if (channel === 'webui') {
+    if (target === 'default' || !target) return 'WebUI Chat';
+    return `WebUI (${target})`;
+  }
+  if (channel === 'cli') {
+    return 'CLI Session';
+  }
+  if (channel === 'discord') {
+    if (userIdentifier) return `Discord > ${userIdentifier}`;
+    return target ? `Discord > #${target}` : 'Discord Session';
+  }
+  if (channel === 'whatsapp') {
+    if (target.endsWith('@g.us')) {
+      return `WhatsApp > Group (${target.split('@')[0]})`;
+    }
+    if (userIdentifier) return `WhatsApp > ${userIdentifier}`;
+    return target ? `WhatsApp > ${target.replace('@s.whatsapp.net', '')}` : 'WhatsApp Session';
+  }
+  if (userIdentifier) {
+    return `${channel} > ${userIdentifier}`;
+  }
+  return sessionKey;
 }
 

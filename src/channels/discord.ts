@@ -33,6 +33,8 @@ import {
   type ThreadChannel,
   type DMChannel,
   type User,
+  type Guild,
+  ChannelType,
   Partials,
 } from 'discord.js';
 import { existsSync } from 'fs';
@@ -692,19 +694,28 @@ export class DiscordChannel {
 
   private async handleAskCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const message = interaction.options.getString('message', true);
+    const parsed = parseIncomingDiscordMentions(
+      message,
+      interaction.guild,
+      this.client,
+      this.client.user?.id
+    );
     const mentionTargets = buildDiscordMentionTargetsFromInteraction(interaction);
     const dndSession = this.dnd.getSessionForThread(interaction.channelId);
     let dndRagContext = 'No relevant RAG context found for this session yet.';
     if (dndSession) {
       try {
-        dndRagContext = await this.dnd.buildNarrativeRagContext(interaction.channelId, message);
+        dndRagContext = await this.dnd.buildNarrativeRagContext(interaction.channelId, parsed.cleanContent);
       } catch (error: any) {
         log.warn({ error: error.message, channelId: interaction.channelId }, 'Failed to build DnD narrative RAG context');
       }
     }
     const rawMessage = dndSession
-      ? this.dnd.buildTableTalkPrompt(interaction.channelId, interaction.user.id, message, dndRagContext)
-      : message;
+      ? this.dnd.buildTableTalkPrompt(interaction.channelId, interaction.user.id, parsed.cleanContent, dndRagContext)
+      : parsed.cleanContent;
+    const isGroup = Boolean(interaction.guildId);
+    const sessionName = buildDiscordSessionName(interaction.channel, interaction.guild);
+
     const effectiveMessage = buildStructuredIncomingMessage(
       {
         platform: 'discord',
@@ -717,9 +728,12 @@ export class DiscordChannel {
           name: interaction.user.displayName ?? interaction.user.username,
           username: interaction.user.username,
         },
-        isGroupChat: Boolean(interaction.guildId),
-        wasMentioned: false,
+        isGroupChat: isGroup,
+        wasMentioned: true,
         mentionTargets,
+        taggedUsers: parsed.taggedUsers,
+        taggedRoles: parsed.taggedRoles,
+        taggedChannels: parsed.taggedChannels,
       },
       rawMessage
     );
@@ -731,6 +745,8 @@ export class DiscordChannel {
     const request: AgentRequest = {
       message: effectiveMessage,
       sessionKey,
+      sessionName,
+      isGroup,
       disablePlanner: Boolean(dndSession),
       channelType: 'discord',
       channelTarget: interaction.channelId,
@@ -870,12 +886,30 @@ export class DiscordChannel {
         if (hasPlan) {
           await flushProgress(true);
           for (const msg of messages) {
-            await interaction.followUp({ content: msg });
+            const resolved = resolveDiscordMentions(msg, mentionTargets, interaction.guild);
+            await interaction.followUp({
+              content: resolved.content,
+              allowedMentions: {
+                parse: ['users', 'roles'],
+                users: resolved.userIds,
+                roles: resolved.roleIds,
+              },
+            });
           }
         } else {
-          await flushProgress(true, messages[0] ?? '(No response)');
+          const first = messages[0] ?? '(No response)';
+          const resolvedFirst = resolveDiscordMentions(first, mentionTargets, interaction.guild);
+          await flushProgress(true, resolvedFirst.content);
           for (let i = 1; i < messages.length; i++) {
-            await interaction.followUp(messages[i]);
+            const resolved = resolveDiscordMentions(messages[i], mentionTargets, interaction.guild);
+            await interaction.followUp({
+              content: resolved.content,
+              allowedMentions: {
+                parse: ['users', 'roles'],
+                users: resolved.userIds,
+                roles: resolved.roleIds,
+              },
+            });
           }
         }
       }
@@ -995,6 +1029,10 @@ export class DiscordChannel {
 
   private async handleRetryCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const sessionKey = `discord:${interaction.channelId}`;
+    const channel = interaction.channel;
+    const isGroup = Boolean(interaction.guild);
+    const sessionName = buildDiscordSessionName(channel, interaction.guild);
+
     const lastUser = this.engine.getMemory().getLastUserMessage(sessionKey);
     if (!lastUser) {
       await interaction.reply({ content: '⚠️ No previous turn found to retry.', ephemeral: true });
@@ -1005,11 +1043,12 @@ export class DiscordChannel {
 
     const req: AgentRequest = {
       sessionKey,
+      sessionName,
+      isGroup,
       message: lastUser.content,
       channelType: 'discord',
       channelTarget: interaction.channelId,
     };
-    const channel = interaction.channel;
     if (channel && 'send' in channel) {
       let output = '';
       for await (const event of this.engine.processRequest(req)) {
@@ -1018,7 +1057,15 @@ export class DiscordChannel {
         }
       }
       if (output.trim()) {
-        await (channel as any).send(output.trim());
+        const resolved = resolveDiscordMentions(output.trim(), [], interaction.guild);
+        await (channel as any).send({
+          content: resolved.content,
+          allowedMentions: {
+            parse: ['users', 'roles'],
+            users: resolved.userIds,
+            roles: resolved.roleIds,
+          },
+        });
       }
     }
   }
@@ -1155,9 +1202,14 @@ export class DiscordChannel {
 
     await interaction.deferReply({ ephemeral: mode === 'private' });
 
+    const isGroup = Boolean(interaction.guild);
+    const sessionName = `${buildDiscordSessionName(interaction.channel, interaction.guild)} [dnd:${mode}]`;
+
     const request: AgentRequest = {
       message: effectiveMessage,
       sessionKey: `discord:dnd-question:${dndDetails.session.id}:${interaction.user.id}:${mode}`,
+      sessionName,
+      isGroup,
       disablePlanner: true,
       disableReasoning: true,
       channelType: 'discord',
@@ -1425,23 +1477,14 @@ export class DiscordChannel {
 
     if (!isMentioned && !isDM && !shouldTreatAsDndTableTalk) return;
 
-    // Replace Discord mentions with readable string formats (@username) before sending to LLM.
-    // Instead of stripping `<@123>`, we map it to `@username`.
-    let content = message.content;
+    const parsed = parseIncomingDiscordMentions(
+      message.content,
+      message.guild,
+      this.client,
+      this.client.user?.id
+    );
     const mentionTargets: MentionTarget[] = buildDiscordMentionTargetsFromMessage(message);
-
-    for (const target of mentionTargets) {
-      if (target.id === this.client.user?.id) continue;
-      // Also catch role mentions, we'll just leave string variants.
-      const pattern = new RegExp(`<@!?${target.id}>`, 'g');
-      content = content.replace(pattern, `@${target.label}`);
-    }
-
-    // Strip out the bot's own mention
-    if (this.client.user) {
-      const selfPattern = new RegExp(`<@!?${this.client.user.id}>`, 'g');
-      content = content.replace(selfPattern, '').trim();
-    }
+    const content = parsed.cleanContent;
 
     if (!content && message.attachments.size === 0) return;
 
@@ -1458,12 +1501,15 @@ export class DiscordChannel {
       ? this.dnd.buildTableTalkPrompt(message.channel.id, message.author.id, content || '(image attached)', dndRagContext)
       : (content || '(image attached)');
 
+    const isGroup = Boolean(message.guildId);
+    const conversationLabel = message.guild
+      ? `Guild #${message.channel.isTextBased() && 'name' in message.channel ? message.channel.name : message.channel.id}`
+      : 'Discord DM';
+
     const effectiveMessage = buildStructuredIncomingMessage(
       {
         platform: 'discord',
-        conversationLabel: message.guild
-          ? `Guild #${message.channel.isTextBased() && 'name' in message.channel ? message.channel.name : message.channel.id}`
-          : 'Discord DM',
+        conversationLabel,
         sender: {
           id: message.author.id,
           label: message.author.tag,
@@ -1471,9 +1517,12 @@ export class DiscordChannel {
           username: message.author.username,
           tag: message.author.tag,
         },
-        isGroupChat: Boolean(message.guildId),
-        wasMentioned: isMentioned || shouldTreatAsDndTableTalk,
+        isGroupChat: isGroup,
+        wasMentioned: isMentioned || parsed.wasBotMentioned || shouldTreatAsDndTableTalk,
         mentionTargets,
+        taggedUsers: parsed.taggedUsers,
+        taggedRoles: parsed.taggedRoles,
+        taggedChannels: parsed.taggedChannels,
         replyContext,
       },
       effectivePrompt
@@ -1507,6 +1556,9 @@ export class DiscordChannel {
   }): Promise<void> {
     const { channel, author, replyTo, effectiveMessage, mentionTargets, images, shouldTreatAsDndTableTalk } = params;
     const sessionKey = `discord:${channel.id}`;
+    const guild = (channel as any).guild || (replyTo as any)?.guild || null;
+    const isGroup = Boolean(guild || (channel as any).guildId || (channel.type !== ChannelType.DM));
+    const sessionName = buildDiscordSessionName(channel, guild);
 
     log.info({
       user: author.tag,
@@ -1570,6 +1622,8 @@ export class DiscordChannel {
         message: effectiveMessage,
         images,
         sessionKey,
+        sessionName,
+        isGroup,
         disablePlanner: shouldTreatAsDndTableTalk,
         channelType: 'discord',
         channelTarget: channel.id,
@@ -1702,7 +1756,7 @@ export class DiscordChannel {
         const decoratedContent = spentNotice && !(structuredNarrative.combatEmbeds?.length > 0)
           ? `${structuredNarrative.content}\n\n*${spentNotice}*`
           : structuredNarrative.content;
-        const resolvedContent = resolveDiscordMentions(decoratedContent, mentionTargets);
+        const resolvedContent = resolveDiscordMentions(decoratedContent, mentionTargets, guild);
         const narrativeEmbed = new EmbedBuilder()
           .setColor(0x8e44ad)
           .setDescription(resolvedContent.content.slice(0, 4096));
@@ -1729,7 +1783,9 @@ export class DiscordChannel {
             ],
             components,
             allowedMentions: {
+              parse: ['users', 'roles'],
               users: resolvedContent.userIds,
+              roles: resolvedContent.roleIds,
               repliedUser: false,
             },
           });
@@ -1758,7 +1814,11 @@ export class DiscordChannel {
               ...structuredNarrative.combatEmbeds,
             ],
             components,
-            allowedMentions: { users: resolvedContent.userIds },
+            allowedMentions: {
+              parse: ['users', 'roles'],
+              users: resolvedContent.userIds,
+              roles: resolvedContent.roleIds,
+            },
           });
           if (dndDetails) {
             await this.dnd.recordCanonicalSceneState({
@@ -1794,11 +1854,13 @@ export class DiscordChannel {
 
           // Send the full response as brand new message(s) after the monitoring card
           for (const msg of messages) {
-            const resolved = resolveDiscordMentions(msg, mentionTargets);
+            const resolved = resolveDiscordMentions(msg, mentionTargets, guild);
             await (channel as any).send({
               content: resolved.content,
               allowedMentions: {
+                parse: ['users', 'roles'],
                 users: resolved.userIds,
+                roles: resolved.roleIds,
               },
             });
           }
@@ -1811,25 +1873,58 @@ export class DiscordChannel {
           }
         } else {
           const first = messages[0] ?? '(No response)';
-          const resolvedFirst = resolveDiscordMentions(first, mentionTargets);
+          const resolvedFirst = resolveDiscordMentions(first, mentionTargets, guild);
+          const hasTags = resolvedFirst.userIds.length > 0 || resolvedFirst.roleIds.length > 0;
 
-          if (progressMessage) {
-            await progressMessage.edit({
-              content: resolvedFirst.content,
-              embeds: [],
-              allowedMentions: {
-                users: resolvedFirst.userIds,
-                repliedUser: false,
-              },
-            });
+          if (hasTags) {
+            // Delete placeholder so sending a new message triggers an active mention notification/ping
+            if (progressMessage) {
+              await progressMessage.delete().catch(() => null);
+              progressMessage = null;
+            }
+            if (replyTo) {
+              await replyTo.reply({
+                content: resolvedFirst.content,
+                allowedMentions: {
+                  parse: ['users', 'roles'],
+                  users: resolvedFirst.userIds,
+                  roles: resolvedFirst.roleIds,
+                  repliedUser: true,
+                },
+              });
+            } else {
+              await (channel as any).send({
+                content: resolvedFirst.content,
+                allowedMentions: {
+                  parse: ['users', 'roles'],
+                  users: resolvedFirst.userIds,
+                  roles: resolvedFirst.roleIds,
+                },
+              });
+            }
+          } else {
+            if (progressMessage) {
+              await progressMessage.edit({
+                content: resolvedFirst.content,
+                embeds: [],
+                allowedMentions: {
+                  parse: ['users', 'roles'],
+                  users: resolvedFirst.userIds,
+                  roles: resolvedFirst.roleIds,
+                  repliedUser: false,
+                },
+              });
+            }
           }
 
           for (let i = 1; i < messages.length; i++) {
-            const resolved = resolveDiscordMentions(messages[i], mentionTargets);
+            const resolved = resolveDiscordMentions(messages[i], mentionTargets, guild);
             await (channel as any).send({
               content: resolved.content,
               allowedMentions: {
+                parse: ['users', 'roles'],
                 users: resolved.userIds,
+                roles: resolved.roleIds,
               },
             });
           }
@@ -2403,6 +2498,86 @@ function buildDndQuestionPrompt(
   ].join('\n');
 }
 
+function buildDiscordSessionName(channel: any, guild?: Guild | null): string {
+  const gName = guild?.name || channel?.guild?.name;
+  if (gName) {
+    if (channel?.isThread?.() || channel?.isThread) {
+      const parent = channel.parent?.name ? `#${channel.parent.name} > ` : '';
+      return `${gName} > ${parent}${channel.name || 'thread'}`;
+    }
+    const cName = channel?.name ? `#${channel.name}` : `#${channel?.id ?? 'channel'}`;
+    return `${gName} > ${cName}`;
+  }
+  if (channel?.isDMBased?.() || channel?.recipient) {
+    const rec = channel.recipient;
+    const name = rec ? (rec.displayName || rec.globalName || rec.username) : 'Direct Message';
+    return `Discord DM > ${name}`;
+  }
+  return `Discord > #${channel?.name || channel?.id || 'channel'}`;
+}
+
+function parseIncomingDiscordMentions(
+  rawContent: string,
+  guild: Guild | null,
+  client: Client,
+  selfUserId?: string
+): {
+  cleanContent: string;
+  taggedUsers: string[];
+  taggedRoles: string[];
+  taggedChannels: string[];
+  wasBotMentioned: boolean;
+} {
+  let content = rawContent;
+  const taggedUsers: string[] = [];
+  const taggedRoles: string[] = [];
+  const taggedChannels: string[] = [];
+  let wasBotMentioned = false;
+
+  // 1. Parse & resolve role mentions: <@&roleId>
+  content = content.replace(/<@&(\d+)>/g, (match, roleId) => {
+    const role = guild?.roles?.cache.get(roleId);
+    const roleName = role ? role.name : roleId;
+    const tag = `@${roleName}`;
+    if (!taggedRoles.includes(tag)) taggedRoles.push(tag);
+    return tag;
+  });
+
+  // 2. Parse & resolve channel mentions: <#channelId>
+  content = content.replace(/<#(\d+)>/g, (match, channelId) => {
+    const chan = guild?.channels?.cache.get(channelId) || client.channels?.cache.get(channelId);
+    const chanName = (chan && 'name' in chan && chan.name) ? chan.name : channelId;
+    const tag = `#${chanName}`;
+    if (!taggedChannels.includes(tag)) taggedChannels.push(tag);
+    return tag;
+  });
+
+  // 3. Parse & resolve user mentions: <@!?userId>
+  content = content.replace(/<@!?(\d+)>/g, (match, userId) => {
+    if (selfUserId && userId === selfUserId) {
+      wasBotMentioned = true;
+      return ''; // Strip bot's own mention from body
+    }
+    const member = guild?.members?.cache.get(userId);
+    const user = client.users?.cache.get(userId);
+    const name = member?.displayName || user?.globalName || user?.username || userId;
+    const tag = `@${name}`;
+    if (!taggedUsers.includes(tag)) taggedUsers.push(tag);
+    return tag;
+  });
+
+  // Clean extra whitespace
+  content = content.trim();
+
+  return {
+    cleanContent: content,
+    taggedUsers,
+    taggedRoles,
+    taggedChannels,
+    wasBotMentioned,
+  };
+}
+
 function buildStructuredIncomingMessage(
   meta: {
     platform: 'discord' | 'whatsapp';
@@ -2411,18 +2586,34 @@ function buildStructuredIncomingMessage(
     isGroupChat: boolean;
     wasMentioned: boolean;
     mentionTargets: MentionTarget[];
+    taggedUsers?: string[];
+    taggedRoles?: string[];
+    taggedChannels?: string[];
     replyContext?: string | null;
   },
   content: string
 ): string {
-  // Compact context header — one line for LLM context, won't clutter WebUI
+  // Compact context header — clear for LLM context
   const senderLabel = meta.sender.name || meta.sender.label || meta.sender.username || 'unknown';
   const senderHandle = meta.sender.username || meta.sender.tag || senderLabel;
   const chatType = meta.isGroupChat ? 'group' : 'DM';
 
   const parts: string[] = [
     `[context: ${meta.platform} | ${chatType} | ${meta.conversationLabel} | sender: ${senderLabel} (${senderHandle})]`,
+    `[bot mentioned: ${meta.wasMentioned ? 'yes' : 'no'}]`,
   ];
+
+  if (meta.taggedUsers && meta.taggedUsers.length > 0) {
+    parts.push(`[tagged users: ${meta.taggedUsers.join(', ')}]`);
+  }
+
+  if (meta.taggedRoles && meta.taggedRoles.length > 0) {
+    parts.push(`[tagged roles: ${meta.taggedRoles.join(', ')}]`);
+  }
+
+  if (meta.taggedChannels && meta.taggedChannels.length > 0) {
+    parts.push(`[tagged channels: ${meta.taggedChannels.join(', ')}]`);
+  }
 
   if (meta.mentionTargets.length > 0) {
     const handles = meta.mentionTargets
@@ -2536,23 +2727,104 @@ function buildNameAliases(label: string): string[] {
   return Array.from(aliases).filter(Boolean);
 }
 
-function resolveDiscordMentions(text: string, targets: MentionTarget[]): { content: string; userIds: string[] } {
+function resolveDiscordMentions(
+  text: string,
+  targets: MentionTarget[],
+  guild?: Guild | null
+): { content: string; userIds: string[]; roleIds: string[] } {
   let content = text;
-  const mentioned = new Set<string>();
+  const userIds = new Set<string>();
+  const roleIds = new Set<string>();
 
+  // 1. Resolve role mentions (@RoleName -> <@&roleId>)
+  if (guild?.roles?.cache) {
+    const roles = Array.from(guild.roles.cache.values())
+      .filter(r => r.name && r.name !== '@everyone')
+      .sort((a, b) => b.name.length - a.name.length);
+
+    for (const role of roles) {
+      const escaped = escapeRegex(role.name);
+      const pattern = new RegExp(`(^|[^\\w<])@${escaped}(?=$|[^\\w>])`, 'giu');
+      if (pattern.test(content)) {
+        content = content.replace(pattern, (match, prefix) => {
+          roleIds.add(role.id);
+          return `${prefix}<@&${role.id}>`;
+        });
+      }
+    }
+  }
+
+  // 2. Resolve channel mentions (#channel-name -> <#channelId>)
+  if (guild?.channels?.cache) {
+    const channels = Array.from(guild.channels.cache.values())
+      .filter(c => c.name)
+      .sort((a, b) => b.name.length - a.name.length);
+
+    for (const chan of channels) {
+      const escaped = escapeRegex(chan.name);
+      const pattern = new RegExp(`(^|[^\\w<])#${escaped}(?=$|[^\\w>])`, 'giu');
+      content = content.replace(pattern, (match, prefix) => {
+        return `${prefix}<#${chan.id}>`;
+      });
+    }
+  }
+
+  // 3. Resolve user mentions (@Username / @DisplayName -> <@userId>)
   for (const target of targets) {
     const sortedAliases = [...target.aliases].sort((a, b) => b.length - a.length);
     for (const alias of sortedAliases) {
       const escaped = escapeRegex(alias.replace(/^@+/, ''));
       const pattern = new RegExp(`(^|[^\\w<])@${escaped}(?=$|[^\\w>])`, 'giu');
-      content = content.replace(pattern, (match, prefix) => {
-        mentioned.add(target.id);
-        return `${prefix}<@${target.id}>`;
-      });
+      if (pattern.test(content)) {
+        content = content.replace(pattern, (match, prefix) => {
+          userIds.add(target.id);
+          return `${prefix}<@${target.id}>`;
+        });
+      }
     }
   }
 
-  return { content, userIds: Array.from(mentioned) };
+  // Also check guild members cache for any other users mentioned by @Name
+  if (guild?.members?.cache) {
+    const members = Array.from(guild.members.cache.values())
+      .filter(m => !m.user.bot)
+      .sort((a, b) => {
+        const nameA = a.displayName || a.user.username;
+        const nameB = b.displayName || b.user.username;
+        return nameB.length - nameA.length;
+      });
+
+    for (const member of members) {
+      const names = [member.displayName, member.user.username, member.user.globalName].filter(Boolean) as string[];
+      for (const name of names) {
+        const escaped = escapeRegex(name.replace(/^@+/, ''));
+        const pattern = new RegExp(`(^|[^\\w<])@${escaped}(?=$|[^\\w>])`, 'giu');
+        if (pattern.test(content)) {
+          content = content.replace(pattern, (match, prefix) => {
+            userIds.add(member.id);
+            return `${prefix}<@${member.id}>`;
+          });
+          break;
+        }
+      }
+    }
+  }
+
+  // 4. Collect any raw user or role IDs already in the content
+  const userMatches = content.matchAll(/<@!?(\d+)>/g);
+  for (const match of userMatches) {
+    userIds.add(match[1]);
+  }
+  const roleMatches = content.matchAll(/<@&(\d+)>/g);
+  for (const match of roleMatches) {
+    roleIds.add(match[1]);
+  }
+
+  return {
+    content,
+    userIds: Array.from(userIds),
+    roleIds: Array.from(roleIds),
+  };
 }
 
 function escapeRegex(value: string): string {

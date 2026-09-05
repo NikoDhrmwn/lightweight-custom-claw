@@ -76,6 +76,8 @@ export class WhatsAppChannel {
   private config: any;
   private sessionDir: string;
   private progresses = new Map<string, WhatsAppProgressState>();
+  private groupNameCache = new Map<string, string>();
+  private contactNameCache = new Map<string, string>();
   private messageQueue: MessageQueueItem[] = [];
   private isProcessingQueue = false;
   private isReconnecting = false;
@@ -631,6 +633,47 @@ export class WhatsAppChannel {
     }
   }
 
+  private async resolveWhatsAppSessionInfo(
+    jid: string,
+    pushName?: string
+  ): Promise<{ sessionName: string; isGroup: boolean; groupSubject?: string }> {
+    const isGroup = jid.endsWith('@g.us');
+    if (isGroup) {
+      let subject = this.groupNameCache.get(jid);
+      if (!subject && this.sock) {
+        try {
+          const meta = await this.sock.groupMetadata(jid);
+          if (meta?.subject) {
+            subject = meta.subject;
+            this.groupNameCache.set(jid, subject);
+            if (meta.participants) {
+              for (const p of meta.participants) {
+                const phone = p.id.split('@')[0].split(':')[0];
+                if (!this.contactNameCache.has(phone)) {
+                  this.contactNameCache.set(phone, phone);
+                }
+              }
+            }
+          }
+        } catch (e: any) {
+          log.warn({ jid, error: e.message }, 'Failed to fetch WhatsApp group metadata');
+        }
+      }
+      const displayName = subject || `Group (${jid.split('@')[0]})`;
+      return {
+        sessionName: `WhatsApp > ${displayName}`,
+        isGroup: true,
+        groupSubject: subject,
+      };
+    }
+
+    const userLabel = pushName || jid.split('@')[0].replace('@s.whatsapp.net', '');
+    return {
+      sessionName: `WhatsApp DM > ${userLabel}`,
+      isGroup: false,
+    };
+  }
+
   private async handleMessage(msg: any, messageContent: any): Promise<void> {
     const jid = msg.key.remoteJid!;
 
@@ -656,7 +699,13 @@ export class WhatsAppChannel {
 
     const isGroup = jid.endsWith('@g.us');
     const senderJid = msg.key.participant || jid;
-    const senderLabel = msg.pushName || senderJid.split('@')[0];
+    const senderPhone = senderJid.split('@')[0].split(':')[0];
+    const senderLabel = msg.pushName || senderPhone;
+
+    // Cache sender contact name
+    if (msg.pushName) {
+      this.contactNameCache.set(senderPhone, msg.pushName);
+    }
 
     // If this is a direct message and no owner is registered yet, auto-register as owner
     if (!isGroup && !ownerRegistry.hasAnyOwner('whatsapp')) {
@@ -767,8 +816,30 @@ export class WhatsAppChannel {
       }
     }
 
+    // Extract tags & mentions
+    const contextInfo =
+      messageContent?.extendedTextMessage?.contextInfo ??
+      messageContent?.imageMessage?.contextInfo ??
+      messageContent?.videoMessage?.contextInfo ??
+      messageContent?.documentMessage?.contextInfo;
+
+    const mentionedJids: string[] = contextInfo?.mentionedJid ?? [];
+    const taggedUsers: string[] = [];
+    for (const mJid of mentionedJids) {
+      const phone = mJid.split('@')[0].split(':')[0];
+      const knownName = this.contactNameCache.get(phone);
+      const tag = knownName ? `@${knownName} (${phone})` : `@${phone}`;
+      if (!taggedUsers.includes(tag)) taggedUsers.push(tag);
+      if (knownName && content) {
+        const phoneRegex = new RegExp(`@${phone}\\b`, 'g');
+        content = content.replace(phoneRegex, `@${knownName} (${phone})`);
+      }
+    }
+
     const mentionTargets = this.extractMentionTargets(msg, messageContent);
     const replyContext = this.extractReplyContext(messageContent);
+    const wasMentioned = didMentionMe(messageContent, this.sock?.user?.id);
+    const sessionInfo = await this.resolveWhatsAppSessionInfo(jid, msg.pushName);
 
     const images = await this.collectIncomingImages(msg, messageContent);
 
@@ -787,16 +858,19 @@ export class WhatsAppChannel {
     const request: AgentRequest = {
       message: buildStructuredIncomingMessage(
         {
-          conversationLabel: jid.endsWith('@g.us') ? `WhatsApp group ${jid}` : `WhatsApp DM ${jid}`,
+          conversationLabel: sessionInfo.groupSubject
+            ? `group: "${sessionInfo.groupSubject}"`
+            : (sessionInfo.isGroup ? `group: ${jid.split('@')[0]}` : `DM: ${msg.pushName || jid.split('@')[0]}`),
           sender: {
             id: msg.key.participant || jid,
             label: msg.pushName || jid.split('@')[0],
             name: msg.pushName || jid.split('@')[0],
             jid: msg.key.participant || jid,
           },
-          isGroupChat: jid.endsWith('@g.us'),
-          wasMentioned: didMentionMe(messageContent, this.sock?.user?.id),
+          isGroupChat: sessionInfo.isGroup,
+          wasMentioned,
           mentionTargets,
+          taggedUsers,
           replyContext,
         },
         content || '(attachment received)'
@@ -804,6 +878,8 @@ export class WhatsAppChannel {
       images: images.length > 0 ? images : undefined,
       attachments: attachments.length > 0 ? attachments : undefined,
       sessionKey,
+      sessionName: sessionInfo.sessionName,
+      isGroup: sessionInfo.isGroup,
       channelType: 'whatsapp',
       channelTarget: jid,
       userIdentifier: msg.pushName || jid.split('@')[0],
@@ -1102,7 +1178,7 @@ export class WhatsAppChannel {
     });
 
     for (const chunk of messages) {
-      const resolved = resolveWhatsAppMentions(chunk, mentionTargets);
+      const resolved = resolveWhatsAppMentions(chunk, mentionTargets, this.contactNameCache);
       await this.sendMessageWithRetry(jid, {
         text: resolved.content,
         mentions: resolved.jids,
@@ -1120,27 +1196,34 @@ export class WhatsAppChannel {
 
     const targets: MentionTarget[] = [];
     const senderJid = msg.key.participant || jid;
-    const senderLabel = msg.pushName || senderJid.split('@')[0];
-    targets.push(createMentionTarget(senderJid, senderLabel, senderJid.split('@')[0]));
+    const senderPhone = senderJid.split('@')[0].split(':')[0];
+    const senderLabel = msg.pushName || senderPhone;
+    targets.push(createMentionTarget(senderJid, senderLabel, senderPhone, msg.pushName));
 
     const quotedParticipant = contextInfo?.participant;
     if (quotedParticipant) {
+      const phone = quotedParticipant.split('@')[0].split(':')[0];
+      const knownName = this.contactNameCache.get(phone);
       targets.push(
         createMentionTarget(
           quotedParticipant,
-          quotedParticipant.split('@')[0],
-          quotedParticipant.split('@')[0]
+          knownName || phone,
+          phone,
+          knownName
         )
       );
     }
 
     const mentioned = contextInfo?.mentionedJid ?? [];
     for (const mentionedJid of mentioned) {
+      const phone = mentionedJid.split('@')[0].split(':')[0];
+      const knownName = this.contactNameCache.get(phone);
       targets.push(
         createMentionTarget(
           mentionedJid,
-          mentionedJid.split('@')[0],
-          mentionedJid.split('@')[0]
+          knownName || phone,
+          phone,
+          knownName
         )
       );
     }
@@ -1338,6 +1421,7 @@ function buildStructuredIncomingMessage(
     isGroupChat: boolean;
     wasMentioned: boolean;
     mentionTargets: MentionTarget[];
+    taggedUsers?: string[];
     replyContext?: string | null;
   },
   content: string
@@ -1349,7 +1433,12 @@ function buildStructuredIncomingMessage(
 
   const parts: string[] = [
     `[context: whatsapp | ${chatType} | ${meta.conversationLabel} | sender: ${senderLabel} (${senderHandle})]`,
+    `[bot mentioned: ${meta.wasMentioned ? 'yes' : 'no'}]`,
   ];
+
+  if (meta.taggedUsers && meta.taggedUsers.length > 0) {
+    parts.push(`[tagged users: ${meta.taggedUsers.join(', ')}]`);
+  }
 
   if (meta.mentionTargets.length > 0) {
     const handles = meta.mentionTargets
@@ -1456,19 +1545,52 @@ function buildNameAliases(label: string): string[] {
   return Array.from(aliases).filter(Boolean);
 }
 
-function resolveWhatsAppMentions(text: string, targets: MentionTarget[]): { content: string; jids: string[] } {
+function resolveWhatsAppMentions(
+  text: string,
+  targets: MentionTarget[],
+  contactCache?: Map<string, string>
+): { content: string; jids: string[] } {
   let content = text;
   const jids = new Set<string>();
 
+  // 1. Detect explicit @phoneNumber (e.g. @628123456789)
+  const phonePattern = /(^|[^\w])@(\d{7,16})(?=$|[^\w])/g;
+  let match: RegExpExecArray | null;
+  while ((match = phonePattern.exec(content)) !== null) {
+    const phone = match[2];
+    jids.add(`${phone}@s.whatsapp.net`);
+  }
+
+  // 2. Resolve known mentionTargets (aliases -> @phone)
   for (const target of targets) {
+    const phone = target.id.split('@')[0].split(':')[0];
     const sortedAliases = [...target.aliases].sort((a, b) => b.length - a.length);
     for (const alias of sortedAliases) {
       const escaped = escapeRegex(alias.replace(/^@+/, ''));
+      if (/^\d+$/.test(escaped)) continue; // Handled by digits regex
       const pattern = new RegExp(`(^|[^\\w])@${escaped}(?=$|[^\\w])`, 'giu');
-      content = content.replace(pattern, (match, prefix) => {
-        jids.add(target.id);
-        return `${prefix}@${target.label}`;
-      });
+      if (pattern.test(content)) {
+        content = content.replace(pattern, (m, prefix) => {
+          jids.add(`${phone}@s.whatsapp.net`);
+          return `${prefix}@${phone}`;
+        });
+      }
+    }
+  }
+
+  // 3. Resolve from contactCache (name -> @phone)
+  if (contactCache) {
+    for (const [phone, name] of contactCache.entries()) {
+      if (!name || name === phone) continue;
+      const escaped = escapeRegex(name.replace(/^@+/, ''));
+      if (/^\d+$/.test(escaped)) continue;
+      const pattern = new RegExp(`(^|[^\\w])@${escaped}(?=$|[^\\w])`, 'giu');
+      if (pattern.test(content)) {
+        content = content.replace(pattern, (m, prefix) => {
+          jids.add(`${phone}@s.whatsapp.net`);
+          return `${prefix}@${phone}`;
+        });
+      }
     }
   }
 

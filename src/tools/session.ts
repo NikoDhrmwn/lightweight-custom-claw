@@ -106,8 +106,8 @@ toolRegistry.register({
     const lines = [`📋 Active Sessions (${sessions.length}):`];
     for (const s of sessions) {
       const lastAct = s.lastActivity ? new Date(s.lastActivity).toLocaleString() : 'Never';
-      const user = s.userIdentifier ? ` (${s.userIdentifier})` : '';
-      lines.push(`• [${s.sessionKey}]${user} — ${s.messageCount} msgs, ~${(s.estimatedTokens ?? 0).toLocaleString()} tokens, last: ${lastAct}`);
+      const label = s.sessionName ? ` "${s.sessionName}"` : (s.userIdentifier ? ` (${s.userIdentifier})` : '');
+      lines.push(`• [${s.sessionKey}]${label} — ${s.messageCount} msgs, ~${(s.estimatedTokens ?? 0).toLocaleString()} tokens, last: ${lastAct}`);
     }
 
     return {
