@@ -258,37 +258,37 @@ export class WhatsAppChannel {
     switch (command) {
       case 'help':
         await this.sendMessageWithRetry(jid, {
-          text: `*LiteClaw Commands*\n\n` +
-                `*/reset* or */clear* - Clear conversation history for this chat\n` +
-                `*/clear <session>* - Clear a specific session\n` +
-                `*/clear all* - Clear all sessions\n` +
-                `*/status* - Show agent and system uptime status\n` +
-                `*/tokens* or */usage* - Show token consumption & context limits\n` +
-                `*/sessions* - List all active sessions\n` +
-                `*/owner* - View registered owner\n` +
-                `*/register-owner* - Register yourself as the instance owner\n` +
-                `*/poll <question> | <opt1> | <opt2> ...* - Send a native WhatsApp poll\n` +
-                `*/event <title> | <time> | [desc]* - Send a native WhatsApp event card\n` +
-                `*/remind <time> | <message>* - Schedule an autonomous reminder\n` +
-                `*/retry* - Re-run the last turn with a fresh attempt\n` +
-                `*/undo* - Revert the last conversation exchange\n` +
-                `*/stop* - Immediately stop currently executing agent task\n` +
-                `*/memory* - View persistent facts (MEMORY.md) and profile (USER.md)\n` +
-                `*/search <query>* - Search full-text conversation history (FTS5)\n` +
-                `*/insights [days]* - View token usage and activity metrics\n` +
-                `*/tasks* or */kanban* - View active Kanban task board\n` +
-                `*/help* - Show this message`
+          text: `*LiteClaw — Commands*\n\n` +
+                `*Conversation*\n` +
+                `/reset · Clear this chat history\n` +
+                `/clear all · Clear all sessions\n` +
+                `/undo · Revert last exchange\n` +
+                `/retry · Re-run last turn\n` +
+                `/stop · Stop running task\n\n` +
+                `*Monitoring*\n` +
+                `/status · Agent & system info\n` +
+                `/tokens · Context window usage\n` +
+                `/sessions · List all sessions\n` +
+                `/insights [days] · Usage analytics\n\n` +
+                `*Utilities*\n` +
+                `/memory · View persistent memory\n` +
+                `/search <query> · Search history\n` +
+                `/tasks · View task board\n` +
+                `/poll <q> | <opt1> | <opt2> · Poll\n` +
+                `/remind <time> | <msg> · Schedule reminder\n` +
+                `/owner · View instance owner\n` +
+                `/help · Show this message`
         });
         return true;
 
       case 'retry': {
         const lastUser = this.engine.getMemory().getLastUserMessage(sessionKey);
         if (!lastUser) {
-          await this.sendMessageWithRetry(jid, { text: '⚠️ No previous turn to retry.' });
+          await this.sendMessageWithRetry(jid, { text: '⚠ No previous turn to retry.' });
           return true;
         }
         this.engine.getMemory().undoLastExchange(sessionKey);
-        await this.sendMessageWithRetry(jid, { text: `🔄 *Retrying turn:* "${lastUser.content.slice(0, 100)}..."` });
+        await this.sendMessageWithRetry(jid, { text: `↩ Retrying: "${lastUser.content.slice(0, 80)}..."` });
         await this.handleMessage(msg, { conversation: lastUser.content });
         return true;
       }
@@ -296,10 +296,10 @@ export class WhatsAppChannel {
       case 'undo': {
         const result = this.engine.getMemory().undoLastExchange(sessionKey);
         if (result.removedCount === 0) {
-          await this.sendMessageWithRetry(jid, { text: '⚠️ No previous exchange found to undo.' });
+          await this.sendMessageWithRetry(jid, { text: '⚠ Nothing to undo.' });
         } else {
           await this.sendMessageWithRetry(jid, {
-            text: `↩️ *Undid last exchange* (${result.removedCount} messages removed).\nPrevious message was: "${(result.undoneUserMessage || '').slice(0, 120)}..."`
+            text: `↩ Undid last exchange (${result.removedCount} messages).`
           });
         }
         return true;
@@ -307,11 +307,9 @@ export class WhatsAppChannel {
 
       case 'stop': {
         const stopped = this.engine.abortSession(sessionKey);
-        if (stopped) {
-          await this.sendMessageWithRetry(jid, { text: '⏹️ *Current agent turn stopped.*' });
-        } else {
-          await this.sendMessageWithRetry(jid, { text: 'ℹ️ No active agent task is currently running.' });
-        }
+        await this.sendMessageWithRetry(jid, {
+          text: stopped ? '⏹ Task stopped.' : 'ℹ No active task running.'
+        });
         return true;
       }
 
@@ -319,9 +317,9 @@ export class WhatsAppChannel {
         const mem = readMemoryFile('memory');
         const usr = readMemoryFile('user');
         await this.sendMessageWithRetry(jid, {
-          text: `🧠 *Persistent Agent Memory*\n\n` +
-                `*👤 USER.md*\n${usr.slice(0, 1000) || '(empty)'}\n\n` +
-                `*📝 MEMORY.md*\n${mem.slice(0, 1000) || '(empty)'}`
+          text: `*Agent Memory*\n\n` +
+                `*User Profile*\n${usr.slice(0, 900) || '(empty)'}\n\n` +
+                `*Saved Facts*\n${mem.slice(0, 900) || '(empty)'}`
         });
         return true;
       }
@@ -334,24 +332,33 @@ export class WhatsAppChannel {
         }
         const matches = this.engine.getMemory().searchFTS(q, 5);
         if (matches.length === 0) {
-          await this.sendMessageWithRetry(jid, { text: `🔍 No history found for "${q}".` });
+          await this.sendMessageWithRetry(jid, { text: `No history found for "${q}".` });
           return true;
         }
-        const formatted = matches.map(m => `• [${new Date(m.timestamp).toLocaleDateString()}] *${m.role}*: ${m.content.slice(0, 150)}...`).join('\n\n');
-        await this.sendMessageWithRetry(jid, { text: `🔍 *History Results for "${q}":*\n\n${formatted}` });
+        const formatted = matches.map(m =>
+          `[${new Date(m.timestamp).toLocaleDateString()}] *${m.role}*: ${m.content.slice(0, 120)}...`
+        ).join('\n\n');
+        await this.sendMessageWithRetry(jid, { text: `*Search: "${q}"*\n\n${formatted}` });
         return true;
       }
 
       case 'insights': {
         const days = Math.max(1, Math.min(90, Number(args[0]) || 7));
         const stats = this.engine.getMemory().getUsageStats(days);
-        const topSess = stats.topSessions.map(s => `• \`${s.sessionKey.slice(0, 20)}\`: ${s.messageCount} msgs (~${s.estimatedTokens.toLocaleString()} tokens)`).join('\n');
+        const topSess = stats.topSessions
+          .slice(0, 3)
+          .map(s => {
+            const info = this.engine.getMemory().getSession(s.sessionKey);
+            const name = info?.sessionName || s.sessionKey.replace(/^(whatsapp|discord|webui):/, '').slice(0, 28);
+            return `  ${name} — ${s.messageCount} msgs`;
+          })
+          .join('\n');
         await this.sendMessageWithRetry(jid, {
-          text: `📊 *Agent Usage Insights (Last ${days} Days)*\n\n` +
-                `💬 *Total Messages:* ${stats.totalMessages.toLocaleString()} (${stats.userMessages} user, ${stats.assistantMessages} bot)\n` +
-                `🔑 *Active Sessions:* ${stats.totalSessions}\n` +
-                `🪙 *Estimated Tokens:* ~${stats.estimatedTokens.toLocaleString()}\n\n` +
-                `*Top Active Sessions:*\n${topSess || '(none)'}`
+          text: `*Insights — Last ${days} days*\n\n` +
+                `Messages: ${stats.totalMessages.toLocaleString()} (${stats.userMessages} user · ${stats.assistantMessages} bot)\n` +
+                `Sessions: ${stats.totalSessions}\n` +
+                `Est. tokens: ~${stats.estimatedTokens.toLocaleString()}\n\n` +
+                `*Top sessions*\n${topSess || '(none)'}`
         });
         return true;
       }
@@ -361,14 +368,16 @@ export class WhatsAppChannel {
         const userKey = sessionKey.split(':')[0] || 'default';
         const boards = this.engine.getMemory().listKanbanBoards(userKey);
         if (boards.length === 0) {
-          await this.sendMessageWithRetry(jid, { text: '📋 No Kanban boards found. Tell the agent "create a task board for X".' });
+          await this.sendMessageWithRetry(jid, { text: 'No boards found. Ask the agent to create one.' });
           return true;
         }
         const board = boards[0];
         const cards = this.engine.getMemory().listKanbanCards(board.id);
-        const formatted = cards.slice(0, 10).map(c => `• [${c.columnName.toUpperCase()}] *${c.title}* ${c.priority ? `(${c.priority})` : ''}`).join('\n');
+        const formatted = cards.slice(0, 10).map(c =>
+          `[${c.columnName.toUpperCase()}] ${c.title}${c.priority ? ` · ${c.priority}` : ''}`
+        ).join('\n');
         await this.sendMessageWithRetry(jid, {
-          text: `📋 *Kanban Board: ${board.name}*\n\n${formatted || '(empty board)'}`
+          text: `*${board.name}*\n\n${formatted || '(empty board)'}`
         });
         return true;
       }
@@ -380,18 +389,20 @@ export class WhatsAppChannel {
           for (const s of sessions) {
             this.engine.getMemory().clearSession(s.sessionKey);
           }
-          await this.sendMessageWithRetry(jid, { text: `🗑 *All ${sessions.length} sessions cleared.* Starting fresh.` });
+          await this.sendMessageWithRetry(jid, {
+            text: `Cleared ${sessions.length} session${sessions.length !== 1 ? 's' : ''}.`
+          });
           return true;
         } else if (args[0] && args[0].includes(':')) {
           const target = args[0].trim();
           this.engine.getMemory().clearSession(target);
-          await this.sendMessageWithRetry(jid, { text: `🗑 *Session "${target}" cleared.*` });
+          await this.sendMessageWithRetry(jid, { text: `Session "${target}" cleared.` });
           return true;
         } else {
           const metrics = this.engine.getMemory().getSessionMetrics(sessionKey);
           this.engine.getMemory().clearSession(sessionKey);
           await this.sendMessageWithRetry(jid, {
-            text: `🗑 *History cleared for this chat.*\nFreed ~${metrics.estimatedTokens.toLocaleString()} tokens across ${metrics.messageCount} messages.`
+            text: `History cleared. Freed ~${metrics.estimatedTokens.toLocaleString()} tokens across ${metrics.messageCount} messages.`
           });
           return true;
         }
@@ -399,14 +410,19 @@ export class WhatsAppChannel {
 
       case 'status': {
         const metrics = this.engine.getMemory().getSessionMetrics(sessionKey);
+        const sessionInfo = this.engine.getMemory().getSession(sessionKey);
         const uptime = process.uptime();
+        const uptimeFmt = formatDurationShort(uptime * 1000);
+        const lastActive = metrics.lastActivity
+          ? new Date(metrics.lastActivity).toLocaleString()
+          : 'never';
         await this.sendMessageWithRetry(jid, {
-          text: `*LiteClaw Status*\n\n` +
-                `🤖 *Agent:* ${this.config.agent?.name || 'Molty'}\n` +
-                `⏳ *Uptime:* ${formatDurationShort(uptime * 1000)}\n` +
-                `💬 *Messages:* ${metrics.messageCount}\n` +
-                `🪙 *Tokens used:* ~${metrics.estimatedTokens.toLocaleString()}\n` +
-                `📅 *Last activity:* ${metrics.lastActivity ? new Date(metrics.lastActivity).toLocaleString() : 'never'}`
+          text: `*Status*\n\n` +
+                `Agent: ${this.config.agent?.name || 'LiteClaw'}\n` +
+                `Uptime: ${uptimeFmt}\n` +
+                `Session: ${sessionInfo?.sessionName || sessionKey}\n` +
+                `Messages: ${metrics.messageCount} · ~${metrics.estimatedTokens.toLocaleString()} tokens\n` +
+                `Last active: ${lastActive}`
         });
         return true;
       }
@@ -414,33 +430,42 @@ export class WhatsAppChannel {
       case 'tokens':
       case 'usage': {
         const metrics = this.engine.getMemory().getSessionMetrics(sessionKey);
+        const sessionInfo = this.engine.getMemory().getSession(sessionKey);
+        const used = metrics.estimatedTokens;
+        const budget = metrics.budgetTokens ?? 51200;
+        const max = metrics.maxContextTokens ?? 64000;
+        const soft = metrics.softThresholdTokens ?? Math.round(max * 0.9);
+        const pct = metrics.usagePct ?? Math.round((used / soft) * 100);
+        const barLen = 16;
+        const filled = Math.min(barLen, Math.round((pct / 100) * barLen));
+        const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
+        const statusLine = pct >= 90 ? '⚠ Near limit' : pct >= 75 ? '△ Moderate' : '● Healthy';
+        const sessionLabel = sessionInfo?.sessionName || sessionKey.replace(/^(whatsapp|discord|webui):/, '');
         await this.sendMessageWithRetry(jid, {
-          text: `*📊 Session Token & Context Metrics*\n\n` +
-                `🔑 *Session:* \`${sessionKey}\`\n` +
-                `💬 *Messages:* ${metrics.messageCount} (Images: ${metrics.imageCount})\n` +
-                `🪙 *Estimated Tokens:* ~${metrics.estimatedTokens.toLocaleString()}\n` +
-                `📦 *Context Budget:* ~${(metrics.budgetTokens ?? 51200).toLocaleString()} tokens (Max: ${(metrics.maxContextTokens ?? 64000).toLocaleString()})\n` +
-                `📈 *Budget Used:* ${metrics.usagePct ?? 0}%\n` +
-                `⚡ *Soft Compaction:* ${(metrics.softThresholdTokens ?? 46080).toLocaleString()} tokens (${metrics.compactionThresholdPct ?? 90}%)\n` +
-                `🛡 *Compaction Status:* ${metrics.isNearCompaction ? '⚠️ Near compaction threshold' : '✅ Healthy'}`
+          text: `*Context Window*\n\n` +
+                `${bar} ${pct}% — ${statusLine}\n` +
+                `${used.toLocaleString()} / ${soft.toLocaleString()} tokens (max ${max.toLocaleString()})\n` +
+                `${metrics.messageCount} messages · ${metrics.imageCount} images\n` +
+                `Session: ${sessionLabel}`
         });
         return true;
       }
 
       case 'sessions': {
-        const sessions = this.engine.getMemory().listSessions().slice(0, 15);
+        const sessions = this.engine.getMemory().listSessions().slice(0, 12);
         if (sessions.length === 0) {
-          await this.sendMessageWithRetry(jid, { text: '📋 *No active sessions recorded.*' });
+          await this.sendMessageWithRetry(jid, { text: 'No sessions recorded.' });
           return true;
         }
-        const lines = [`*📋 Active Sessions (${sessions.length})*:\n`];
+        const lines = [`*Sessions (${sessions.length})*\n`];
         for (const s of sessions) {
-          const isCurrent = s.sessionKey === sessionKey ? ' 👈 _(here)_' : '';
-          const user = s.userIdentifier ? ` (${s.userIdentifier})` : '';
-          const last = s.lastActivity ? new Date(s.lastActivity).toLocaleDateString() : 'Never';
-          lines.push(`• \`${s.sessionKey}\`${user}${isCurrent}\n  💬 ${s.messageCount} msgs | 🪙 ~${(s.estimatedTokens ?? 0).toLocaleString()} tok | 📅 ${last}`);
+          const isCurrent = s.sessionKey === sessionKey ? ' ←' : '';
+          const name = s.sessionName || s.sessionKey.replace(/^(whatsapp|discord|webui):/, '').slice(0, 30);
+          const last = s.lastActivity ? new Date(s.lastActivity).toLocaleDateString() : '—';
+          const toks = (s.estimatedTokens ?? 0).toLocaleString();
+          lines.push(`*${name}*${isCurrent}\n  ${s.messageCount} msgs · ~${toks} tokens · ${last}`);
         }
-        await this.sendMessageWithRetry(jid, { text: lines.join('\n') });
+        await this.sendMessageWithRetry(jid, { text: lines.join('\n\n') });
         return true;
       }
 

@@ -11,6 +11,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [1.0.2] - 2026-09-05
+
+#### Added
+
+- **Centralized version singleton** (`src/version.ts`): Single source of truth reads from `package.json` at runtime with directory-traversal fallback. All source files now import `VERSION` instead of hardcoding it.
+- **Version bump script** (`scripts/bump-version.js`): `npm run bump <version>` updates `package.json` and `package-lock.json` atomically.
+- **WhatsApp group participant tagging**: Persistent contact cache (`~/.liteclaw/whatsapp-contacts.json`) with first-name alias support; group participants surface in agent context as `[group participants: @Name (phone)]`; outgoing mentions resolved to full JIDs via `buildNameAliases`.
+
+#### Changed
+
+- **Monitoring commands redesigned** (WhatsApp & Discord) — minimal, professional output with no raw session JIDs exposed:
+  - `/tokens` — compact progress bar, human-readable session name, clear status label (Healthy / Moderate / Near limit).
+  - `/sessions` — shows session name instead of raw `whatsapp:...@g.us` key; current session marked with `←`.
+  - `/status` — condensed 5-line format; session name displayed.
+  - `/insights` — top sessions show names, not truncated keys; field labels simplified.
+  - `/help` — grouped into Conversation / Monitoring / Utilities sections.
+  - Discord `/help`, `/status`, `/tokens`, `/insights` embeds similarly simplified.
+
 ### [1.0.1] - 2026-09-04
 
 #### Added

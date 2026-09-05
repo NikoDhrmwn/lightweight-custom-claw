@@ -927,23 +927,24 @@ export class DiscordChannel {
     const config = getConfig();
     const port = config.gateway?.port ?? 7860;
 
-    let gatewayStatus = '❌ Offline';
+    let gatewayUptime: string | null = null;
     try {
       const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) });
       if (res.ok) {
         const data = await res.json() as any;
-        gatewayStatus = `✅ Online (uptime: ${Math.floor(data.uptime / 60)}m)`;
+        gatewayUptime = `${Math.floor(data.uptime / 60)}m`;
       }
     } catch { /* offline */ }
 
+    const pending = this.confirmations.getPending().length;
+
     const embed = new EmbedBuilder()
-      .setAuthor({ name: 'LiteClaw · System Status' })
-      .setColor(0x00897B)
+      .setAuthor({ name: 'LiteClaw · Status' })
+      .setColor(gatewayUptime ? 0x00897B : 0x757575)
       .setDescription([
-        `**Gateway** › ${gatewayStatus}`,
-        `**State** › \`${this.currentState}\``,
-        '',
-        `🔄 **${this.activeRequests}** active request${this.activeRequests !== 1 ? 's' : ''}  ·  ⏳ **${this.confirmations.getPending().length}** pending confirmation${this.confirmations.getPending().length !== 1 ? 's' : ''}`,
+        `**Gateway** · ${gatewayUptime ? `Online · uptime ${gatewayUptime}` : 'Offline'}`,
+        `**State** · \`${this.currentState}\``,
+        `**Requests** · ${this.activeRequests} active${pending > 0 ? ` · ${pending} pending confirmation${pending !== 1 ? 's' : ''}` : ''}`,
       ].join('\n'))
       .setTimestamp();
 
@@ -969,59 +970,63 @@ export class DiscordChannel {
       .setAuthor({ name: 'LiteClaw · Help' })
       .setColor(0x5E35B1)
       .setDescription([
-        '*A lightweight AI agent running locally. Mention me or use slash commands.*',
+        '*Lightweight AI agent running locally. Mention me or use slash commands.*',
         '',
-        '**━━━ Commands ━━━**',
-        '`/ask` · Ask a question or give a task',
-        '`/status` · Show bot status and health',
-        '`/clear` · Clear conversation history',
-        '`/model` · Show current model info',
-        '`/tokens` · Show session token usage',
+        '**Commands**',
+        '`/ask` · Ask or task the agent',
+        '`/status` · System status',
+        '`/tokens` · Context window usage',
+        '`/insights` · Usage analytics',
+        '`/clear` · Clear session history',
+        '`/memory` · View persistent memory',
+        '`/search` · Search history',
+        '`/model` · Current model info',
         '',
-        '**━━━ Capabilities ━━━**',
-        '📁 File Operations · 💻 Shell Commands',
-        '🔍 Web Search · 👁️ Vision',
+        '**Capabilities**',
+        'File ops · Shell · Web search · Vision · Voice',
         '',
-        '**━━━ Reactions ━━━**',
-        '👀 Received · 🧠 Thinking · ⚙️ Working · ✅ Done',
-        '',
-        '💬 You can also `@mention` me in any channel.',
+        '`@mention` me in any channel to chat.',
       ].join('\n'));
 
     await interaction.reply({ embeds: [embed] });
   }
+
 
   private async handleTokensCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const sessionKey = `discord:${interaction.channelId}`;
     const { MemoryStore } = await import('../core/memory.js');
     const memory = new MemoryStore();
     const metrics = memory.getSessionMetrics(sessionKey);
+    const sessionInfo = memory.getSession(sessionKey);
     memory.close();
 
     const thresholds = resolveContextThresholds();
     const maxTokens = thresholds.maxContextTokens;
-    const threshold = thresholds.softThresholdTokens;
-
+    const soft = thresholds.softThresholdTokens;
     const currentTokens = metrics.estimatedTokens;
+    const percentage = Math.round((currentTokens / soft) * 100);
 
-    const percentage = Math.round((currentTokens / threshold) * 100);
-    let statusEmoji = '🟢';
-    if (percentage > 90) statusEmoji = '🔴';
-    else if (percentage > 75) statusEmoji = '🟡';
+    let statusLabel = 'Healthy';
+    let color = 0x00897B;
+    if (percentage > 90) { statusLabel = 'Near limit'; color = 0xD50000; }
+    else if (percentage > 75) { statusLabel = 'Moderate'; color = 0xFFAB00; }
 
     const barLength = 16;
     const filledCount = Math.round((percentage / 100) * barLength);
     const tokenBar = '█'.repeat(Math.min(filledCount, barLength)) + '░'.repeat(Math.max(0, barLength - filledCount));
 
+    const channelName = interaction.channel && 'name' in interaction.channel && interaction.channel.name
+      ? `#${interaction.channel.name}`
+      : sessionInfo?.sessionName || `channel:${interaction.channelId}`;
+
     const embed = new EmbedBuilder()
       .setAuthor({ name: 'LiteClaw · Context Window' })
-      .setColor(percentage > 90 ? 0xD50000 : percentage > 75 ? 0xFFAB00 : 0x00897B)
+      .setColor(color)
       .setDescription([
-        `${statusEmoji} \`${tokenBar}\` **${percentage}%**`,
-        `**${currentTokens.toLocaleString()}** / ${threshold.toLocaleString()} tokens`,
-        '',
-        `💬 **${metrics.messageCount}** messages · 🖼️ **${metrics.imageCount}** images`,
-        `📐 Budget: **${maxTokens.toLocaleString()}** max · compacts at **${thresholds.compactionPct}%**`,
+        `\`${tokenBar}\` **${percentage}%** — ${statusLabel}`,
+        `**${currentTokens.toLocaleString()}** / ${soft.toLocaleString()} tokens (max ${maxTokens.toLocaleString()})`,
+        `${metrics.messageCount} messages · ${metrics.imageCount} images`,
+        `Session: ${channelName}`,
       ].join('\n'));
 
     await interaction.reply({ embeds: [embed] });
@@ -1125,15 +1130,22 @@ export class DiscordChannel {
   private async handleInsightsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const days = Math.max(1, Math.min(90, interaction.options.getInteger('days') ?? 7));
     const stats = this.engine.getMemory().getUsageStats(days);
-    const topSess = stats.topSessions.map(s => `• \`${s.sessionKey.slice(0, 20)}\`: ${s.messageCount} msgs (~${s.estimatedTokens.toLocaleString()} tokens)`).join('\n');
+    const topSess = stats.topSessions
+      .slice(0, 5)
+      .map(s => {
+        const info = this.engine.getMemory().getSession(s.sessionKey);
+        const name = info?.sessionName || s.sessionKey.replace(/^(whatsapp|discord|webui):/, '').slice(0, 32);
+        return `\`${name}\` — ${s.messageCount} msgs · ~${(s.estimatedTokens ?? 0).toLocaleString()} tokens`;
+      })
+      .join('\n');
     const embed = new EmbedBuilder()
-      .setAuthor({ name: `LiteClaw · Insights (Last ${days} Days)` })
+      .setAuthor({ name: `LiteClaw · Insights — Last ${days} days` })
       .setColor(0x3949AB)
       .addFields(
-        { name: '💬 Total Messages', value: `${stats.totalMessages.toLocaleString()} (${stats.userMessages} user, ${stats.assistantMessages} bot)`, inline: true },
-        { name: '🔑 Active Sessions', value: `${stats.totalSessions}`, inline: true },
-        { name: '🪙 Estimated Tokens', value: `~${stats.estimatedTokens.toLocaleString()}`, inline: true },
-        { name: '🏆 Top Sessions', value: topSess || '(none)' }
+        { name: 'Messages', value: `${stats.totalMessages.toLocaleString()} total (${stats.userMessages} user · ${stats.assistantMessages} bot)`, inline: false },
+        { name: 'Sessions', value: `${stats.totalSessions}`, inline: true },
+        { name: 'Est. Tokens', value: `~${stats.estimatedTokens.toLocaleString()}`, inline: true },
+        { name: 'Top Sessions', value: topSess || '(none)' }
       );
     await interaction.reply({ embeds: [embed] });
   }
