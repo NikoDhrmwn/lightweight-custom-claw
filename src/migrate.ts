@@ -11,6 +11,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync } from 'fs';
 import { join } from 'path';
 import { getStateDir, saveConfig, type LiteClawConfig } from './config.js';
+import { VERSION } from './version.js';
 import YAML from 'yaml';
 import chalk from 'chalk';
 
@@ -70,7 +71,7 @@ export async function migrateFromOpenClaw(openclawDir: string): Promise<void> {
 
   // ─── 3. Build config.yaml ──────────────────────────────────────
   const config: LiteClawConfig = {
-    meta: { version: '0.8.3' },
+    meta: { version: VERSION },
 
     llm: {
       providers: {},

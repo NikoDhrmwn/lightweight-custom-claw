@@ -5,8 +5,8 @@ import type { ToolDefinition, ToolResult } from './tools.js';
 import { toolRegistry } from './tools.js';
 import { getConfig, type LiteClawConfig, type MCPServerConfig } from '../config.js';
 import { createLogger } from '../logger.js';
+import { VERSION } from '../version.js';
 
-const VERSION = '0.8.3';
 const log = createLogger('mcp');
 
 interface MCPServerConnection {

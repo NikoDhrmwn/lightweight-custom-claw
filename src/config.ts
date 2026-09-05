@@ -10,6 +10,7 @@ import { join, dirname } from 'path';
 import YAML from 'yaml';
 import { config as loadDotenv } from 'dotenv';
 import { createLogger } from './logger.js';
+import { VERSION } from './version.js';
 
 const log = createLogger('config');
 
@@ -211,7 +212,7 @@ export function reloadConfig(configPath?: string): LiteClawConfig {
 
 export function getDefaultConfig(): LiteClawConfig {
   return {
-    meta: { version: '1.0.1' },
+    meta: { version: VERSION },
     llm: {
       providers: {
         local: {

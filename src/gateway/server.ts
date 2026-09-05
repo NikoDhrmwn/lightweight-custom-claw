@@ -20,6 +20,7 @@ import { getConfig, getConfigPath, getStateDir, loadConfig, reloadConfig, saveCo
 import { createLogger } from '../logger.js';
 import { processFile } from '../core/file_processor.js';
 import { WebUIVoiceSession } from '../voice/webui-voice.js';
+import { VERSION } from '../version.js';
 
 const log = createLogger('gateway');
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -371,7 +372,7 @@ export class GatewayServer {
 
     return {
       status: 'ok',
-      version: '0.8.4',
+      version: VERSION,
       name: config.agent?.name ?? 'LiteClaw',
       model: primary.split('/').pop() ?? primary,
       primaryModel: primary,
@@ -448,7 +449,7 @@ export class GatewayServer {
 
     return {
       meta: {
-        version: config.meta?.version ?? '0.8.4',
+        version: config.meta?.version ?? VERSION,
       },
       paths: {
         stateDir: getStateDir(),

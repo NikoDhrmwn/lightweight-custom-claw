@@ -12,6 +12,7 @@
     "dev": "npm run build && tsx src/index.ts",
     "start": "npm run build && node dist/index.js",
     "cli": "tsx src/cli.ts",
+    "bump": "node scripts/bump-version.js",
     "lint": "tsc --noEmit"
   },
   "engines": {

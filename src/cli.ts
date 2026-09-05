@@ -34,8 +34,7 @@ import {
   resolvePromptTarget,
   writeMinimalPromptSet,
 } from './prompt_manager.js';
-
-const VERSION = '0.8.3';
+import { VERSION } from './version.js';
 
 const program = new Command();
 
@@ -62,7 +61,6 @@ gateway
   .option('--force', 'Kill any existing listener on the target port')
   .option('--verbose', 'Verbose logging')
   .action(async (options) => {
-    console.log(chalk.green(`\n🦎 LiteClaw ${VERSION}\n`));
     const spinner = ora('Starting gateway...').start();
 
     try {

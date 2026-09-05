@@ -40,8 +40,8 @@ import './tools/skills.js';
 import './tools/reach.js';
 import { SchedulerService } from './core/scheduler.js';
 import { getMemoryStore } from './core/memory.js';
+import { VERSION } from './version.js';
 
-const VERSION = '1.0.1';
 const log = createLogger('main');
 
 export async function startGateway(portOverride?: number): Promise<void> {

@@ -78,6 +78,8 @@ export class WhatsAppChannel {
   private progresses = new Map<string, WhatsAppProgressState>();
   private groupNameCache = new Map<string, string>();
   private contactNameCache = new Map<string, string>();
+  private groupParticipantsCache = new Map<string, Array<{ id: string; phone: string; name?: string }>>();
+  private contactFilePath: string;
   private messageQueue: MessageQueueItem[] = [];
   private isProcessingQueue = false;
   private isReconnecting = false;
@@ -87,10 +89,13 @@ export class WhatsAppChannel {
     this.confirmations = confirmations;
     this.config = getConfig().channels?.whatsapp ?? {};
     this.sessionDir = join(getStateDir(), 'whatsapp-session');
+    this.contactFilePath = join(getStateDir(), 'whatsapp-contacts.json');
 
     if (!existsSync(this.sessionDir)) {
       mkdirSync(this.sessionDir, { recursive: true });
     }
+
+    this.loadContacts();
 
     channelRegistry.register('whatsapp', {
       sendMessage: async (target: string, content: string, options?: any) => {
@@ -633,6 +638,44 @@ export class WhatsAppChannel {
     }
   }
 
+  private loadContacts(): void {
+    if (existsSync(this.contactFilePath)) {
+      try {
+        const raw = readFileSync(this.contactFilePath, 'utf-8');
+        const parsed = JSON.parse(raw);
+        for (const [phone, name] of Object.entries(parsed)) {
+          if (typeof name === 'string' && name && name !== phone) {
+            this.contactNameCache.set(phone, name);
+          }
+        }
+      } catch (err: any) {
+        log.warn({ error: err.message }, 'Failed to load whatsapp-contacts.json');
+      }
+    }
+  }
+
+  private saveContact(phone: string, name: string): void {
+    if (!phone || !name || name === phone) return;
+    const cleanName = name.replace(/^@+/, '').trim();
+    if (!cleanName || /^\d+$/.test(cleanName)) return;
+    this.contactNameCache.set(phone, cleanName);
+
+    for (const participants of this.groupParticipantsCache.values()) {
+      const match = participants.find(p => p.phone === phone);
+      if (match) match.name = cleanName;
+    }
+
+    try {
+      const obj: Record<string, string> = {};
+      for (const [p, n] of this.contactNameCache.entries()) {
+        obj[p] = n;
+      }
+      writeFileSync(this.contactFilePath, JSON.stringify(obj, null, 2), 'utf-8');
+    } catch {
+      // ignore
+    }
+  }
+
   private async resolveWhatsAppSessionInfo(
     jid: string,
     pushName?: string
@@ -640,20 +683,29 @@ export class WhatsAppChannel {
     const isGroup = jid.endsWith('@g.us');
     if (isGroup) {
       let subject = this.groupNameCache.get(jid);
-      if (!subject && this.sock) {
+      if ((!subject || !this.groupParticipantsCache.has(jid)) && this.sock) {
         try {
           const meta = await this.sock.groupMetadata(jid);
           if (meta?.subject) {
             subject = meta.subject;
             this.groupNameCache.set(jid, subject);
-            if (meta.participants) {
-              for (const p of meta.participants) {
-                const phone = p.id.split('@')[0].split(':')[0];
-                if (!this.contactNameCache.has(phone)) {
-                  this.contactNameCache.set(phone, phone);
-                }
+          }
+          if (meta?.participants) {
+            const participants: Array<{ id: string; phone: string; name?: string }> = [];
+            for (const p of meta.participants) {
+              const phone = (p.phoneNumber ? p.phoneNumber.split('@')[0] : p.id.split('@')[0]).split(':')[0];
+              const displayName = (p as any).notify || (p as any).name;
+              if (displayName && displayName !== phone) {
+                this.saveContact(phone, displayName);
               }
+              const resolvedName = displayName || this.contactNameCache.get(phone);
+              participants.push({
+                id: p.id,
+                phone,
+                name: resolvedName && resolvedName !== phone ? resolvedName : undefined,
+              });
             }
+            this.groupParticipantsCache.set(jid, participants);
           }
         } catch (e: any) {
           log.warn({ jid, error: e.message }, 'Failed to fetch WhatsApp group metadata');
@@ -704,7 +756,7 @@ export class WhatsAppChannel {
 
     // Cache sender contact name
     if (msg.pushName) {
-      this.contactNameCache.set(senderPhone, msg.pushName);
+      this.saveContact(senderPhone, msg.pushName);
     }
 
     // If this is a direct message and no owner is registered yet, auto-register as owner
@@ -824,6 +876,37 @@ export class WhatsAppChannel {
       messageContent?.documentMessage?.contextInfo;
 
     const mentionedJids: string[] = contextInfo?.mentionedJid ?? [];
+
+    // Contextual contact name inference:
+    // If someone is tagged by @Name or "tag <Name>" in this message,
+    // associate that non-bot JID with the name and persist it!
+    const botPhone = (this.sock?.user?.id ?? '').split('@')[0].split(':')[0];
+    const senderPhoneOnly = senderPhone;
+    for (const mJid of mentionedJids) {
+      const phone = mJid.split('@')[0].split(':')[0];
+      if (phone === botPhone || phone === senderPhoneOnly) continue;
+      if (!this.contactNameCache.has(phone)) {
+        // Check for @Word mentions in content
+        const atMatches = Array.from(content.matchAll(/@([a-zA-Z\u00C0-\u017F][a-zA-Z0-9_\u00C0-\u017F]*)/g));
+        const candidate = atMatches.find(m => {
+          const w = m[1].toLowerCase();
+          return w !== 'molty' && w !== 'bot' && !w.includes('liteclaw');
+        });
+        if (candidate) {
+          this.saveContact(phone, candidate[1]);
+        } else {
+          // Check for "tag <Word>" / "tagging <Word>" / "panggil <Word>"
+          const verbMatch = /(?:tag|tagging|panggil|mention)\s+([a-zA-Z\u00C0-\u017F][a-zA-Z0-9_\u00C0-\u017F]*)/i.exec(content);
+          if (verbMatch && verbMatch[1]) {
+            this.saveContact(phone, verbMatch[1]);
+          }
+        }
+      }
+    }
+
+    // Resolve sessionInfo FIRST to load group participants and subject
+    const sessionInfo = await this.resolveWhatsAppSessionInfo(jid, msg.pushName);
+
     const taggedUsers: string[] = [];
     for (const mJid of mentionedJids) {
       const phone = mJid.split('@')[0].split(':')[0];
@@ -836,10 +919,9 @@ export class WhatsAppChannel {
       }
     }
 
-    const mentionTargets = this.extractMentionTargets(msg, messageContent);
+    const mentionTargets = this.extractMentionTargets(msg, messageContent, sessionInfo.isGroup);
     const replyContext = this.extractReplyContext(messageContent);
     const wasMentioned = didMentionMe(messageContent, this.sock?.user?.id);
-    const sessionInfo = await this.resolveWhatsAppSessionInfo(jid, msg.pushName);
 
     const images = await this.collectIncomingImages(msg, messageContent);
 
@@ -1186,7 +1268,7 @@ export class WhatsAppChannel {
     }
   }
 
-  private extractMentionTargets(msg: any, messageContent: any): MentionTarget[] {
+  private extractMentionTargets(msg: any, messageContent: any, isGroup = false): MentionTarget[] {
     const jid = msg.key.remoteJid!;
     const contextInfo =
       messageContent?.extendedTextMessage?.contextInfo ??
@@ -1197,7 +1279,7 @@ export class WhatsAppChannel {
     const targets: MentionTarget[] = [];
     const senderJid = msg.key.participant || jid;
     const senderPhone = senderJid.split('@')[0].split(':')[0];
-    const senderLabel = msg.pushName || senderPhone;
+    const senderLabel = msg.pushName || this.contactNameCache.get(senderPhone) || senderPhone;
     targets.push(createMentionTarget(senderJid, senderLabel, senderPhone, msg.pushName));
 
     const quotedParticipant = contextInfo?.participant;
@@ -1226,6 +1308,24 @@ export class WhatsAppChannel {
           knownName
         )
       );
+    }
+
+    // In groups, include all known group participants so LLM can address and tag them
+    if (isGroup) {
+      const groupParts = this.groupParticipantsCache.get(jid) ?? [];
+      const botPhone = (this.sock?.user?.id ?? '').split('@')[0].split(':')[0];
+      for (const p of groupParts) {
+        if (p.phone === botPhone) continue;
+        const name = this.contactNameCache.get(p.phone) || p.name;
+        targets.push(
+          createMentionTarget(
+            p.id,
+            name || p.phone,
+            p.phone,
+            name
+          )
+        );
+      }
     }
 
     return dedupeMentionTargets(targets);
@@ -1437,15 +1537,22 @@ function buildStructuredIncomingMessage(
   ];
 
   if (meta.taggedUsers && meta.taggedUsers.length > 0) {
-    parts.push(`[tagged users: ${meta.taggedUsers.join(', ')}]`);
+    parts.push(`[tagged in this message: ${meta.taggedUsers.join(', ')}]`);
   }
 
   if (meta.mentionTargets.length > 0) {
-    const handles = meta.mentionTargets
-      .slice(0, 8)
-      .map(t => `@${t.aliases[0]} (${t.label})`)
+    const namedTargets = meta.mentionTargets.filter(t => {
+      const p = t.id.split('@')[0].split(':')[0];
+      return t.label && t.label !== p && !/^\d+$/.test(t.label);
+    });
+    const selected = (namedTargets.length > 0 ? namedTargets : meta.mentionTargets).slice(0, 10);
+    const handles = selected
+      .map(t => {
+        const phone = t.id.split('@')[0].split(':')[0];
+        return t.label && t.label !== phone ? `@${t.label} (${phone})` : `@${phone}`;
+      })
       .join(', ');
-    parts.push(`[participants: ${handles}]`);
+    parts.push(`[group participants: ${handles}]`);
   }
 
   if (meta.replyContext) {
@@ -1542,6 +1649,14 @@ function buildNameAliases(label: string): string[] {
   aliases.add(clean.replace(/\s+/g, ''));
   aliases.add(clean.replace(/[^\p{L}\p{N}_ ]/gu, '').trim());
   aliases.add(clean.replace(/[^\p{L}\p{N}_ ]/gu, '').replace(/\s+/g, '_').trim());
+
+  // Also include first name if multi-word (e.g. "Aldy Susanto" -> "Aldy")
+  const parts = clean.split(/\s+/);
+  if (parts.length > 1 && parts[0].length >= 2) {
+    aliases.add(parts[0]);
+    aliases.add(parts[0].toLowerCase());
+  }
+
   return Array.from(aliases).filter(Boolean);
 }
 
@@ -1564,6 +1679,7 @@ function resolveWhatsAppMentions(
   // 2. Resolve known mentionTargets (aliases -> @phone)
   for (const target of targets) {
     const phone = target.id.split('@')[0].split(':')[0];
+    const targetJid = target.id.includes('@') ? target.id : `${phone}@s.whatsapp.net`;
     const sortedAliases = [...target.aliases].sort((a, b) => b.length - a.length);
     for (const alias of sortedAliases) {
       const escaped = escapeRegex(alias.replace(/^@+/, ''));
@@ -1571,7 +1687,7 @@ function resolveWhatsAppMentions(
       const pattern = new RegExp(`(^|[^\\w])@${escaped}(?=$|[^\\w])`, 'giu');
       if (pattern.test(content)) {
         content = content.replace(pattern, (m, prefix) => {
-          jids.add(`${phone}@s.whatsapp.net`);
+          jids.add(targetJid);
           return `${prefix}@${phone}`;
         });
       }
@@ -1582,14 +1698,19 @@ function resolveWhatsAppMentions(
   if (contactCache) {
     for (const [phone, name] of contactCache.entries()) {
       if (!name || name === phone) continue;
-      const escaped = escapeRegex(name.replace(/^@+/, ''));
-      if (/^\d+$/.test(escaped)) continue;
-      const pattern = new RegExp(`(^|[^\\w])@${escaped}(?=$|[^\\w])`, 'giu');
-      if (pattern.test(content)) {
-        content = content.replace(pattern, (m, prefix) => {
-          jids.add(`${phone}@s.whatsapp.net`);
-          return `${prefix}@${phone}`;
-        });
+      const targetJid = `${phone}@s.whatsapp.net`;
+      const aliases = buildNameAliases(name);
+      const sortedAliases = aliases.sort((a, b) => b.length - a.length);
+      for (const alias of sortedAliases) {
+        const escaped = escapeRegex(alias.replace(/^@+/, ''));
+        if (/^\d+$/.test(escaped)) continue;
+        const pattern = new RegExp(`(^|[^\\w])@${escaped}(?=$|[^\\w])`, 'giu');
+        if (pattern.test(content)) {
+          content = content.replace(pattern, (m, prefix) => {
+            jids.add(targetJid);
+            return `${prefix}@${phone}`;
+          });
+        }
       }
     }
   }

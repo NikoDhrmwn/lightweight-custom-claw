@@ -564,9 +564,30 @@ export class AgentEngine extends EventEmitter {
     if (request.channelType === 'webui') {
       systemPrompt += `\n\n${WEBUI_FORMATTING_RULES}`;
     } else if (request.channelType === 'discord') {
-      systemPrompt += `\n\n# Discord Tagging & Mentions\n- You can tag/mention users, roles, or channels when relevant.\n- To mention a user: write @Username or @DisplayName (e.g. @Alice) or <@userId>.\n- To mention a role: write @RoleName.\n- To mention a channel: write #channel-name.\n- The system will automatically resolve recognized @mentions into active Discord pings.`;
+      systemPrompt += `\n\n# Discord Tagging & Mentions
+- You can tag/mention users, roles, or channels when relevant.
+- To mention a user: write @Username or @DisplayName (e.g. @Alice) or <@userId>.
+- To mention a role: write @RoleName.
+- To mention a channel: write #channel-name.
+- CRITICAL INSTRUCTION FOR TAGGING:
+  1. When a user asks you to tag, mention, ping, call, or greet someone (e.g. "try tagging @Alice", "tag Bob", "ping @role", "panggil @Alice"):
+     You MUST IMMEDIATELY write the tag (e.g. "@Alice", "@Bob") directly in your response text!
+  2. NEVER say you will tag them without emitting the tag (DO NOT say "Bisa. Aku bakal tag..." or "I will tag them" without the tag). Always emit the tag in this very response!
+  3. Example:
+     User: "try tagging Aldy like this @Aldy"
+     Assistant: "Siap! Halo @Aldy 🙌" or "Bisa, ini @Aldy sudah aku tag ya!"
+- The system will automatically resolve recognized @mentions into active Discord pings.`;
     } else if (request.channelType === 'whatsapp') {
-      systemPrompt += `\n\n# WhatsApp Tagging & Mentions\n- In group chats, you can tag/mention participants by writing @Name or @phoneNumber (e.g. @Alice or @628123456789).\n- The system will automatically resolve recognized @mentions into active WhatsApp pings.`;
+      systemPrompt += `\n\n# WhatsApp Tagging & Mentions
+- In group chats, you can tag/mention participants by writing @Name or @phoneNumber (e.g. @Aldy or @628123456789).
+- CRITICAL INSTRUCTION FOR TAGGING:
+  1. When a user asks you to tag, mention, ping, call, or greet someone (e.g. "try tagging Aldy like this @Aldy", "tag Aldy", "coba tag Aldy", "panggil @Aldy"):
+     You MUST IMMEDIATELY write the tag (e.g. "@Aldy" or "@phoneNumber") directly in your response text!
+  2. NEVER say you will tag them without emitting the tag (DO NOT say "Bisa. Aku bakal tag..." or "I will tag them" without the tag). Always emit the tag in this very response!
+  3. Example:
+     User: "@Molty Bot try tagging Aldy like this @Aldy"
+     Assistant: "Siap! Halo @Aldy 🙌" or "Bisa, ini @Aldy sudah aku tag ya!"
+- The system will automatically resolve recognized @mentions into active WhatsApp pings.`;
     }
 
     const mcpInstructions = mcpManager.getPromptAppendix();
